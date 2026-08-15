@@ -13,3 +13,4 @@
           python nifty_algo_paper.py
           python nifty_stock_fno_master_screener.py
           python telegram_bot.py
+run: |
