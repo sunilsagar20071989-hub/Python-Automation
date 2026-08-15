@@ -3,7 +3,7 @@ name: Automated FNO & Nifty Strategy Pipeline
 on:
   workflow_dispatch:
   schedule:
-    - cron: '30 3 * * 1-5'
+    - cron: '0 4-10 * * 1-5'
 
 jobs:
   run-all-strategies:
