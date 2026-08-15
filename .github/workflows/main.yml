@@ -1,4 +1,24 @@
-- name: Install Dependencies
+name: Run Python Automation Scripts
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '15 3 * * 1-5'
+
+jobs:
+  run-automation:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repo code
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
           pip install requests pandas telebot smartapi-python pyotp ta
@@ -13,4 +33,3 @@
           python nifty_algo_paper.py
           python nifty_stock_fno_master_screener.py
           python telegram_bot.py
-run: |
