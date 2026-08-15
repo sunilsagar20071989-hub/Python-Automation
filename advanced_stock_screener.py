@@ -1,3 +1,4 @@
+import os
 import time
 from datetime import datetime, timedelta
 import pandas as pd
@@ -7,16 +8,17 @@ import ta
 from SmartApi import SmartConnect
 
 # ==========================================
-# 1. CONFIGURATION & STRICT THRESHOLDS
+# 1. CONFIGURATION & SECURE ENVIRONMENT VARIABLES
 # ==========================================
-API_KEY = "N7XNbnkE"
-CLIENT_CODE = "S885143"
-PIN = "1989"
-TOTP_SECRET = "ZH76UOCDHM4TITQGDKN32HBZEI"
+# Fetching credentials securely from GitHub Secrets / Environment Variables
+API_KEY = os.getenv("SMARTAPI_API_KEY")
+CLIENT_CODE = os.getenv("SMARTAPI_CLIENT_CODE")
+PIN = os.getenv("SMARTAPI_PIN")
+TOTP_SECRET = os.getenv("SMARTAPI_TOTP_SECRET")
 
 # STRATEGY THRESHOLDS (Strict Momentum Criteria)
-MIN_RSI = 60.0      # RSI must be >= 60
-MIN_ROC = 0.0       # ROC must be > 0
+MIN_RSI = 60.0       # RSI must be >= 60
+MIN_ROC = 0.0        # ROC must be > 0
 ENABLE_EMA_FILTER = True # Enforce EMA 9 > EMA 21 & Close > EMA 44
 
 SECTORS_WATCHLIST = [
@@ -66,6 +68,10 @@ FNO_UNIVERSE_BY_SECTOR = {
 # ==========================================
 def initialize_smartapi():
     try:
+        if not all([API_KEY, CLIENT_CODE, PIN, TOTP_SECRET]):
+            print(">>> Error: Environment variables/secrets not set properly.")
+            return None
+
         smart_api = SmartConnect(api_key=API_KEY)
         totp_code = pyotp.TOTP(TOTP_SECRET).now()
         data = smart_api.generateSession(CLIENT_CODE, PIN, totp_code)
@@ -193,12 +199,13 @@ def scan_fno_universe(auth_token):
 def main():
     auth_token = initialize_smartapi()
     if not auth_token:
+        print(">>> Session initialization failed. Exiting.")
         return
 
     all_scanned, qualified_matches = scan_fno_universe(auth_token)
 
     print("\n" + "="*95)
-    print("                     RAW METRICS LOG (ALL SCANNED F&O STOCKS)")
+    print("                    RAW METRICS LOG (ALL SCANNED F&O STOCKS)")
     print("="*95)
     if all_scanned:
         df_all = pd.DataFrame(all_scanned)
