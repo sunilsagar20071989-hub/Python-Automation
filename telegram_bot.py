@@ -10,3 +10,4 @@ def get_chat_id(message):
 
 print("Bot sun raha hai... ab Telegram par apne bot ko 'Hi' bhejein.")
 bot.polling()
+run: |
