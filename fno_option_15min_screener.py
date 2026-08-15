@@ -308,7 +308,5 @@ def main():
     )
     send_telegram_message(telegram_msg_match)
 
-
 if __name__ == "__main__":
      main()
-  main()
