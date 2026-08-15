@@ -178,3 +178,4 @@ total_t = target_count + sl_count
 win_rate = (target_count / total_t * 100) if total_t > 0 else 0
 print(f"Total Trades: {total_t} | Target (+16%): {target_count} | SL (-8%): {sl_count} | Win Rate: {win_rate:.2f}%")
 print("="*85)
+run: |
