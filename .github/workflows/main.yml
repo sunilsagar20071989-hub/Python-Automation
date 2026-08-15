@@ -1,22 +1,15 @@
-name: Python Cloud Automation
+- name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests pandas telebot smartapi-python pyotp ta
 
-on:
-  schedule:
-    - cron: '0 */6 * * *'
-  workflow_dispatch:
-
-jobs:
-  run-automation:
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Check out repo code
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: '3.10'
-
-      - name: Execute Python Script
-        run: python main.py
+      - name: Execute All Python Scripts
+        run: |
+          python advanced_stock_screener.py
+          python backtest.py
+          python fetch_trades.py
+          python fno_option_15min_screener.py
+          python nifty_algo.py
+          python nifty_algo_paper.py
+          python nifty_stock_fno_master_screener.py
+          python telegram_bot.py
