@@ -714,374 +714,8 @@ def get_itm_symbol_and_token(spot_price, option_type):
         print(f">>> ITM Token Lookup Exception: {e}")
 
     return None, None
-    # ==========================================
-# 6. STRATEGY ENGINE & EXECUTION LOOP
-# ==========================================
-import time
-import pandas as pd
-import ta
-from datetime import datetime
-
-# Global fallback state variables
-cached_close = None
-cached_signal = "NO_TRADE"
-last_candle_minute = -1
-
-
-def fetch_signals_and_data():
-    """Fetches 5m candles, calculates indicators, applies filters & returns (close, signal)"""
-    global cached_close, cached_signal, last_candle_minute
-
-    now_minute = datetime.now().minute
-    to_date = datetime.now().strftime("%Y-%m-%d %H:%M")
-    from_date = (datetime.now() - pd.Timedelta(days=5)).strftime("%Y-%m-%d %H:%M")
-
-    param = {
-        "exchange": "NSE",
-        "symboltoken": NIFTY_TOKEN,
-        "interval": "FIVE_MINUTE",
-        "fromdate": from_date,
-        "todate": to_date,
-    }
-
-    try:
-        resp = smartApi.getCandleData(param)
-
-        if resp and resp.get("status") and resp.get("data"):
-            last_candle_minute = now_minute
-            df = pd.DataFrame(resp["data"], columns=["timestamp", "open", "high", "low", "close", "volume"])
-            df["close"] = df["close"].astype(float)
-            df["high"] = df["high"].astype(float)
-            df["low"] = df["low"].astype(float)
-            df["open"] = df["open"].astype(float)
-            df["volume"] = df["volume"].astype(float)
-
-            # Safeguard: Minimum candles check for EMA 200 calculation
-            if len(df) < 200:
-                print(">>> 5m Signal Warning: Insufficient candles to calculate EMA 200.")
-                return get_nifty_spot_ltp(), "NO_TRADE"
-
-            df["rsi"] = ta.momentum.rsi(df["close"], window=14)
-            df["roc"] = ta.momentum.roc(df["close"], window=12)
-            df["ema_9"] = ta.trend.ema_indicator(df["close"], window=9)
-            df["ema_21"] = ta.trend.ema_indicator(df["close"], window=21)
-            df["ema_44"] = ta.trend.ema_indicator(df["close"], window=44)
-            df["ema_200"] = ta.trend.ema_indicator(df["close"], window=200)
-            df["vol_sma20"] = df["volume"].rolling(window=20).mean()
-
-            curr = df.iloc[-1]
-            prev = df.iloc[-2]
-
-            df["date"] = pd.to_datetime(df["timestamp"]).dt.date
-            today_candles = df[df["date"] == datetime.now().date()]
-            day_open = today_candles.iloc[0]["open"] if not today_candles.empty else curr["open"]
-            gap_pct = (day_open - prev["close"]) / prev["close"]
-
-            bullish_cross = (prev["ema_9"] <= prev["ema_21"]) and (curr["ema_9"] > curr["ema_21"])
-            bearish_cross = (prev["ema_9"] >= prev["ema_21"]) and (curr["ema_9"] < curr["ema_21"])
-
-            bounce_ce = (curr["low"] <= curr["ema_44"] * 1.002) and (curr["close"] > curr["ema_44"])
-            reject_pe = (curr["high"] >= curr["ema_44"] * 0.998) and (curr["close"] < curr["ema_44"])
-
-            vol_confirm = curr["volume"] >= (curr["vol_sma20"] * 0.9)
-
-            ce_confirm = (
-                (curr["rsi"] >= 58)
-                and (curr["roc"] > 0.1)
-                and (curr["close"] > curr["ema_200"])
-                and vol_confirm
-            )
-
-            pe_confirm = (
-                (curr["rsi"] <= 42)
-                and (curr["roc"] < -0.1)
-                and (curr["close"] < curr["ema_200"])
-                and vol_confirm
-            )
-
-            raw_signal = "NO_TRADE"
-            if (bullish_cross or bounce_ce) and ce_confirm:
-                raw_signal = "CE"
-            elif (bearish_cross or reject_pe) and pe_confirm:
-                raw_signal = "PE"
-
-            if raw_signal == "NO_TRADE":
-                cached_close, cached_signal = curr["close"], "NO_TRADE"
-                return cached_close, cached_signal
-
-            # Volatility Filter
-            vix = get_india_vix()
-            if vix < MIN_VIX or vix > MAX_VIX:
-                print(f"\n⚠️ [VIX BLOCK] VIX is {vix:.2f}. Signal Skipped!")
-                cached_close, cached_signal = curr["close"], "NO_TRADE"
-                return cached_close, cached_signal
-
-            # Gap Filter
-            if raw_signal == "CE" and gap_pct > MAX_GAP_PCT:
-                print(f"\n⚠️ [GAP BLOCK] Gap-Up too high ({gap_pct*100:.2f}%). CE Skipped!")
-                cached_close, cached_signal = curr["close"], "NO_TRADE"
-                return cached_close, cached_signal
-            elif raw_signal == "PE" and gap_pct < -MAX_GAP_PCT:
-                print(f"\n⚠️ [GAP BLOCK] Gap-Down too deep ({gap_pct*100:.2f}%). PE Skipped!")
-                cached_close, cached_signal = curr["close"], "NO_TRADE"
-                return cached_close, cached_signal
-
-            # 15m Trend Alignment Filter
-            trend_15m = get_15m_trend()
-            if (raw_signal == "CE" and trend_15m != "BULLISH") or (raw_signal == "PE" and trend_15m != "BEARISH"):
-                print(f"\n⚠️ SIGNAL IGNORED: 5m Signal ({raw_signal}) does not match 15m Trend ({trend_15m}).")
-                cached_close, cached_signal = curr["close"], "NO_TRADE"
-                return cached_close, cached_signal
-
-            # Option Chain Filter
-            oc_data = fetch_option_chain_data(curr["close"])
-            if oc_data:
-                df_oc = pd.DataFrame(oc_data)
-                total_put_oi = df_oc[df_oc['option_type'] == 'PE']['open_interest'].sum()
-                total_call_oi = df_oc[df_oc['option_type'] == 'CE']['open_interest'].sum()
-                pcr = total_put_oi / total_call_oi if total_call_oi > 0 else 1.0
-
-                res_strike = df_oc[df_oc['option_type'] == 'CE'].loc[df_oc[df_oc['option_type'] == 'CE']['open_interest'].idxmax()]['strike']
-                sup_strike = df_oc[df_oc['option_type'] == 'PE'].loc[df_oc[df_oc['option_type'] == 'PE']['open_interest'].idxmax()]['strike']
-
-                is_safe = validate_trade_with_option_chain(
-                    signal=raw_signal,
-                    current_price=curr["close"],
-                    pcr=pcr,
-                    resistance_strike=res_strike,
-                    support_strike=sup_strike
-                )
-
-                if not is_safe:
-                    cached_close, cached_signal = curr["close"], "NO_TRADE"
-                    return cached_close, cached_signal
-
-            cached_close, cached_signal = curr["close"], raw_signal
-            return cached_close, cached_signal
-
-    except Exception as e:
-        print("\n>>> Fetch Signals Error:", e)
-
-    spot = get_nifty_spot_ltp()
-    if spot is not None:
-        cached_close = spot
-    return cached_close, cached_signal
-
-
-def place_order(symbol, token, buy_sell, quantity):
-    """Executes order using SmartAPI and returns valid Order ID"""
-    params = {
-        "variety": "NORMAL",
-        "tradingsymbol": symbol,
-        "symboltoken": str(token),
-        "transactiontype": buy_sell,
-        "exchange": "NFO",
-        "ordertype": "MARKET",
-        "producttype": "CARRYFORWARD",
-        "duration": "DAY",
-        "price": "0",
-        "quantity": str(quantity),
-    }
-    try:
-        response = smartApi.placeOrder(params)
-        if response and response.get("status") and "data" in response:
-            order_id = response["data"].get("orderid")
-            print(f"\n[ORDER EXECUTED] {buy_sell} | ID: {order_id} | Symbol: {symbol} | Qty: {quantity}")
-            return order_id
-        else:
-            print(f"\n>>> Order Placement Rejected by API: {response.get('message', 'Unknown Error')}")
-            return None
-    except Exception as e:
-        print(f"\n>>> Order Execution Exception ({buy_sell}):", e)
-        return None
-
-
-# ==========================================
-# 7. MAIN ENGINE EXECUTION LOOP
-# ==========================================
-print(">>> Nifty Algo Bot Active (Telegram Commands + Trailing SL + Risk Manager Enabled)...")
-send_telegram_alert("🤖 <b>Nifty Algo Bot Activated!</b>\nDynamic Position Sizing, Trailing SL & Remote Commands Ready.\nSend /help to see commands.")
-
-while True:
-    try:
-        if is_market_open():
-            # Check Max Daily Limit
-            if daily_trades_count >= MAX_DAILY_TRADES:
-                print(f"\r🛑 Max Daily Limit ({MAX_DAILY_TRADES} Trades) Reached. Bot Paused.", end="")
-                time.sleep(15)
-                continue
-
-            # Check Consecutive Stop Loss Limit
-            if consecutive_sl_count >= 2:
-                print("\r🛑 2 Consecutive Stop Loss Hit! Protection Active.", end="")
-                time.sleep(15)
-                continue
-
-            close, signal = fetch_signals_and_data()
-
-            if close is not None:
-                # 1. Mandatory Auto Square-off (3:10 PM)
-                if is_squareoff_time() and pos_active:
-                    ltp = get_live_ltp(active_token, active_symbol) or entry_price
-                    print(f"\n[AUTO SQUARE-OFF 03:10 PM] Closing position for {active_symbol} at ₹{ltp:.2f}")
-                    place_order(active_symbol, active_token, "SELL", active_quantity)
-                    
-                    log_trade(active_symbol, "BUY", entry_price, ltp, active_quantity, "AUTO_SQUARE_OFF")
-                    send_telegram_alert(
-                        f"⏰ <b>AUTO SQUARE-OFF (03:10 PM)</b>\n"
-                        f"<b>Symbol:</b> {active_symbol}\n"
-                        f"<b>Exit Price:</b> ₹{ltp:.2f}\n"
-                        f"<b>Entry Price:</b> ₹{entry_price:.2f}\n"
-                        f"<b>PnL:</b> ₹{round((ltp - entry_price) * active_quantity, 2)}"
-                    )
-                    pos_active = False
-                    daily_trades_count += 1
-
-                # 2. Manage Active Position
-                elif pos_active:
-                    ltp = get_live_ltp(active_token, active_symbol)
-                    holding_time_mins = (datetime.now() - trade_entry_time).total_seconds() / 60.0
-
-                    if ltp is not None:
-                        # Dynamic Trailing Stop Loss Engine
-                        if ENABLE_TRAILING_SL:
-                            if ltp > highest_price_seen:
-                                highest_price_seen = ltp
-                            
-                            gain_pct = (highest_price_seen - entry_price) / entry_price
-                            if gain_pct >= TSL_ACTIVATION_PCT:
-                                steps = int((gain_pct - TSL_ACTIVATION_PCT) / TSL_STEP_TRIGGER_PCT)
-                                new_sl = round(entry_price * (1 + (steps * TSL_STEP_MOVE_PCT)), 2)
-                                if new_sl > sl_price:
-                                    sl_price = new_sl
-                                    print(f"\n[TRAILING SL UPDATED] Raised SL to ₹{sl_price:.2f} (High: ₹{highest_price_seen:.2f})")
-
-                        print(
-                            f"\r[POS ACTIVE] {active_symbol} | LTP: ₹{ltp:.2f} | SL: ₹{sl_price:.2f} | TGT: ₹{tgt_price:.2f} | Time: {holding_time_mins:.1f}m/{MAX_HOLDING_MINUTES}m",
-                            end="",
-                        )
-
-                        # Stop Loss Exit Check
-                        if ltp <= sl_price:
-                            reason = "TRAILING_SL_HIT" if sl_price > (entry_price * (1 - SL_PCT)) else "INITIAL_SL_HIT"
-                            print(f"\n[EXIT SL] {reason} for {active_symbol} at ₹{ltp:.2f}")
-                            place_order(active_symbol, active_token, "SELL", active_quantity)
-                            
-                            log_trade(active_symbol, "BUY", entry_price, ltp, active_quantity, reason)
-                            send_telegram_alert(
-                                f"🔴 <b>STOP LOSS HIT ({reason})</b>\n"
-                                f"<b>Symbol:</b> {active_symbol}\n"
-                                f"<b>Exit Price:</b> ₹{ltp:.2f}\n"
-                                f"<b>Entry Price:</b> ₹{entry_price:.2f}\n"
-                                f"<b>PnL:</b> ₹{round((ltp - entry_price) * active_quantity, 2)}"
-                            )
-                            pos_active = False
-                            daily_trades_count += 1
-                            if ltp < entry_price:
-                                consecutive_sl_count += 1
-
-                        # Target Exit Check
-                        elif ltp >= tgt_price:
-                            print(f"\n[EXIT TARGET] Target Hit for {active_symbol} at ₹{ltp:.2f}")
-                            place_order(active_symbol, active_token, "SELL", active_quantity)
-                            
-                            log_trade(active_symbol, "BUY", entry_price, ltp, active_quantity, "TARGET_ACHIEVED")
-                            send_telegram_alert(
-                                f"🟢 <b>TARGET ACHIEVED</b> 🎉\n"
-                                f"<b>Symbol:</b> {active_symbol}\n"
-                                f"<b>Exit Price:</b> ₹{ltp:.2f}\n"
-                                f"<b>Entry Price:</b> ₹{entry_price:.2f}\n"
-                                f"<b>PnL:</b> ₹{round((ltp - entry_price) * active_quantity, 2)}"
-                            )
-                            pos_active = False
-                            daily_trades_count += 1
-                            consecutive_sl_count = 0
-
-                        # Time Expiration Exit Check
-                        elif holding_time_mins >= MAX_HOLDING_MINUTES:
-                            print(f"\n[EXIT THETA TIMEOUT] Auto-Exiting {active_symbol} at ₹{ltp:.2f}")
-                            place_order(active_symbol, active_token, "SELL", active_quantity)
-                            
-                            log_trade(active_symbol, "BUY", entry_price, ltp, active_quantity, "THETA_TIMEOUT")
-                            send_telegram_alert(
-                                f"⏱️ <b>THETA TIMEOUT EXIT ({MAX_HOLDING_MINUTES}m)</b>\n"
-                                f"<b>Symbol:</b> {active_symbol}\n"
-                                f"<b>Exit Price:</b> ₹{ltp:.2f}\n"
-                                f"<b>Entry Price:</b> ₹{entry_price:.2f}\n"
-                                f"<b>PnL:</b> ₹{round((ltp - entry_price) * active_quantity, 2)}"
-                            )
-                            pos_active = False
-                            daily_trades_count += 1
-
-                # 3. Fresh Entry Execution Check
-                elif not pos_active and signal in ["CE", "PE"] and not algo_paused and is_new_entry_allowed():
-                    sym, tok = get_itm_symbol_and_token(close, signal)
-                    if sym and tok:
-                        opt_ltp = get_live_ltp(tok, sym)
-                        if opt_ltp is None:
-                            opt_data = smartApi.ltpData("NFO", sym, tok)
-                            if opt_data and opt_data.get("status") and "data" in opt_data:
-                                opt_ltp = float(opt_data["data"]["ltp"])
-
-                        if opt_ltp and opt_ltp > 0:
-                            qty = calculate_dynamic_quantity(opt_ltp)
-                            order_id = place_order(sym, tok, "BUY", qty)
-                            if order_id:
-                                active_symbol = sym
-                                active_token = tok
-                                entry_price = opt_ltp
-                                sl_price = round(opt_ltp * (1 - SL_PCT), 2)
-                                tgt_price = round(opt_ltp * (1 + TARGET_PCT), 2)
-                                highest_price_seen = opt_ltp
-                                active_quantity = qty
-                                trade_entry_time = datetime.now()
-                                pos_active = True
-
-                                setup_and_subscribe_websocket(tok)
-                                send_telegram_alert(
-                                    f"🚀 <b>NEW TRADE ENTERED ({signal})</b>\n"
-                                    f"<b>Symbol:</b> {sym}\n"
-                                    f"<b>Entry Price:</b> ₹{entry_price:.2f}\n"
-                                    f"<b>SL:</b> ₹{sl_price:.2f}\n"
-                                    f"<b>Target:</b> ₹{tgt_price:.2f}\n"
-                                    f"<b>Qty:</b> {qty}"
-                                )
-        else:
-            print("\r⏸️ Market Closed. Waiting for market session...", end="")
-            time.sleep(10)
-
-# ==========================================
-# SYSTEM CONFIGURATION & CONSTANTS
-# ==========================================
-SL_PCT = 0.10  # 10% Initial Stop Loss
-TARGET_PCT = 0.20  # 20% Target
-MAX_HOLDING_MINUTES = 30  # Max time per position
-
-# Trailing Stop Loss Parameters
-ENABLE_TRAILING_SL = True
-TSL_ACTIVATION_PCT = 0.05  # Activate TSL after 5% gain
-TSL_STEP_TRIGGER_PCT = 0.03  # Every 3% further movement
-TSL_STEP_MOVE_PCT = 0.02  # Move SL up by 2%
-
-# Risk Management Counters (Must remain OUTSIDE the while loop)
-MAX_DAILY_TRADES = 4
-consecutive_sl_count = 0
-consecutive_win_count = 0
-daily_trades_count = 0
-algo_paused = False
-
-active_symbol = ""
-active_token = ""
-entry_price = 0.0
-sl_price = 0.0
-tgt_price = 0.0
-highest_price_seen = 0.0
-active_quantity = 0
-trade_entry_time = None
-pos_active = False
-
-# ==========================================
-# MAIN ENGINE EXECUTION LOOP
+   # ==========================================
+# REFACTORED MAIN ENGINE EXECUTION LOOP
 # ==========================================
 print(">>> Nifty Auto Bot Active (Auto Entry + Risk Rules + Trailing SL)...")
 send_telegram_alert(
@@ -1093,60 +727,15 @@ send_telegram_alert(
 while True:
     try:
         if is_market_open():
-            # Max 4 Trades Limit Check
-            if daily_trades_count >= MAX_DAILY_TRADES:
-                print(
-                    f"\r🛑 Max Daily Limit ({MAX_DAILY_TRADES} Trades) Reached. Bot Stopped.",
-                    end="",
-                    flush=True,
-                )
-                time.sleep(15)
-                continue
-
-            # RULE 1: 2 Consecutive Losses -> Stop trading for the day
-            if consecutive_sl_count >= 2:
-                print(
-                    "\r🛑 2 Consecutive Losses Hit! Stopping Trading for Today.",
-                    end="",
-                    flush=True,
-                )
-                time.sleep(15)
-                continue
-
-            # RULE 2: 3 Consecutive Profits -> Stop trading for the day
-            if consecutive_win_count >= 3:
-                print(
-                    "\r🎉 3 Consecutive Profits Hit! Target Met, Bot Paused.",
-                    end="",
-                    flush=True,
-                )
-                time.sleep(15)
-                continue
-
             close, signal = fetch_signals_and_data()
 
             if close is not None:
-                # 1. AUTO SQUARE-OFF AT 03:10 PM
+                # 1. AUTO SQUARE-OFF AT 03:10 PM (Always Prioritized)
                 if is_squareoff_time() and pos_active:
-                    ltp = (
-                        get_live_ltp(active_token, active_symbol)
-                        or entry_price
-                    )
-                    print(
-                        f"\n[AUTO SQUARE-OFF 03:10 PM] Closing position for {active_symbol} at ₹{ltp:.2f}"
-                    )
-                    place_order(
-                        active_symbol, active_token, "SELL", active_quantity
-                    )
-
-                    log_trade(
-                        active_symbol,
-                        "BUY",
-                        entry_price,
-                        ltp,
-                        active_quantity,
-                        "AUTO_SQUARE_OFF",
-                    )
+                    ltp = get_live_ltp(active_token, active_symbol) or entry_price
+                    print(f"\n[AUTO SQUARE-OFF 03:10 PM] Exiting {active_symbol} at ₹{ltp:.2f}")
+                    place_order(active_symbol, active_token, "SELL", active_quantity)
+                    log_trade(active_symbol, "BUY", entry_price, ltp, active_quantity, "AUTO_SQUARE_OFF")
                     send_telegram_alert(
                         f"⏰ <b>AUTO SQUARE-OFF (03:10 PM)</b>\n"
                         f"<b>Symbol:</b> {active_symbol}\n"
@@ -1157,37 +746,24 @@ while True:
                     daily_trades_count += 1
                     highest_price_seen = 0.0
 
-                # 2. DYNAMIC ACTIVE POSITION MONITOR
+                # 2. DYNAMIC ACTIVE POSITION MONITOR (Always Prioritized)
                 elif pos_active:
                     ltp = get_live_ltp(active_token, active_symbol)
-                    holding_time_mins = (
-                        datetime.now() - trade_entry_time
-                    ).total_seconds() / 60.0
+                    holding_time_mins = (datetime.now() - trade_entry_time).total_seconds() / 60.0
 
                     if ltp is not None:
-                        # Trailing Stop Loss Calculation
+                        # Trailing Stop Loss Engine
                         if ENABLE_TRAILING_SL:
                             if ltp > highest_price_seen:
                                 highest_price_seen = ltp
 
-                            gain_pct = (
-                                highest_price_seen - entry_price
-                            ) / entry_price
+                            gain_pct = (highest_price_seen - entry_price) / entry_price
                             if gain_pct >= TSL_ACTIVATION_PCT:
-                                steps = int(
-                                    (gain_pct - TSL_ACTIVATION_PCT)
-                                    / TSL_STEP_TRIGGER_PCT
-                                )
-                                new_sl = round(
-                                    entry_price
-                                    * (1 + (steps * TSL_STEP_MOVE_PCT)),
-                                    2,
-                                )
+                                steps = int((gain_pct - TSL_ACTIVATION_PCT) / TSL_STEP_TRIGGER_PCT)
+                                new_sl = round(entry_price * (1 + (steps * TSL_STEP_MOVE_PCT)), 2)
                                 if new_sl > sl_price:
                                     sl_price = new_sl
-                                    print(
-                                        f"\n[TRAILING SL UPDATED] Raised SL to ₹{sl_price:.2f}"
-                                    )
+                                    print(f"\n[TRAILING SL UPDATED] Raised SL to ₹{sl_price:.2f}")
 
                         print(
                             f"\r[POS ACTIVE] {active_symbol} | LTP: ₹{ltp:.2f} | SL: ₹{sl_price:.2f} | TGT: ₹{tgt_price:.2f} | Time: {holding_time_mins:.1f}m/{MAX_HOLDING_MINUTES}m",
@@ -1195,31 +771,12 @@ while True:
                             flush=True,
                         )
 
-                        # Stop Loss Exit Check
+                        # Exit Checks
                         if ltp <= sl_price:
-                            reason = (
-                                "TRAILING_SL_HIT"
-                                if sl_price > (entry_price * (1 - SL_PCT))
-                                else "INITIAL_SL_HIT"
-                            )
-                            print(
-                                f"\n[EXIT SL] {reason} for {active_symbol} at ₹{ltp:.2f}"
-                            )
-                            place_order(
-                                active_symbol,
-                                active_token,
-                                "SELL",
-                                active_quantity,
-                            )
-
-                            log_trade(
-                                active_symbol,
-                                "BUY",
-                                entry_price,
-                                ltp,
-                                active_quantity,
-                                reason,
-                            )
+                            reason = "TRAILING_SL_HIT" if sl_price > (entry_price * (1 - SL_PCT)) else "INITIAL_SL_HIT"
+                            print(f"\n[EXIT SL] {reason} for {active_symbol} at ₹{ltp:.2f}")
+                            place_order(active_symbol, active_token, "SELL", active_quantity)
+                            log_trade(active_symbol, "BUY", entry_price, ltp, active_quantity, reason)
                             send_telegram_alert(
                                 f"🔴 <b>STOP LOSS HIT ({reason})</b>\n"
                                 f"<b>Symbol:</b> {active_symbol}\n"
@@ -1232,26 +789,10 @@ while True:
                             consecutive_win_count = 0
                             highest_price_seen = 0.0
 
-                        # Target Exit Check
                         elif ltp >= tgt_price:
-                            print(
-                                f"\n[EXIT TARGET] Target Hit for {active_symbol} at ₹{ltp:.2f}"
-                            )
-                            place_order(
-                                active_symbol,
-                                active_token,
-                                "SELL",
-                                active_quantity,
-                            )
-
-                            log_trade(
-                                active_symbol,
-                                "BUY",
-                                entry_price,
-                                ltp,
-                                active_quantity,
-                                "TARGET_ACHIEVED",
-                            )
+                            print(f"\n[EXIT TARGET] Target Hit for {active_symbol} at ₹{ltp:.2f}")
+                            place_order(active_symbol, active_token, "SELL", active_quantity)
+                            log_trade(active_symbol, "BUY", entry_price, ltp, active_quantity, "TARGET_ACHIEVED")
                             send_telegram_alert(
                                 f"🟢 <b>TARGET ACHIEVED</b> 🎉\n"
                                 f"<b>Symbol:</b> {active_symbol}\n"
@@ -1264,26 +805,10 @@ while True:
                             consecutive_sl_count = 0
                             highest_price_seen = 0.0
 
-                        # Theta Timeout Exit Check
                         elif holding_time_mins >= MAX_HOLDING_MINUTES:
-                            print(
-                                f"\n[EXIT THETA TIMEOUT] Auto-Exiting {active_symbol} at ₹{ltp:.2f}"
-                            )
-                            place_order(
-                                active_symbol,
-                                active_token,
-                                "SELL",
-                                active_quantity,
-                            )
-
-                            log_trade(
-                                active_symbol,
-                                "BUY",
-                                entry_price,
-                                ltp,
-                                active_quantity,
-                                "THETA_TIMEOUT",
-                            )
+                            print(f"\n[EXIT THETA TIMEOUT] Auto-Exiting {active_symbol} at ₹{ltp:.2f}")
+                            place_order(active_symbol, active_token, "SELL", active_quantity)
+                            log_trade(active_symbol, "BUY", entry_price, ltp, active_quantity, "THETA_TIMEOUT")
                             send_telegram_alert(
                                 f"⏱️ <b>THETA TIMEOUT EXIT</b>\n"
                                 f"<b>Symbol:</b> {active_symbol}\n"
@@ -1296,58 +821,50 @@ while True:
                             if ltp < entry_price:
                                 consecutive_sl_count += 1
                                 consecutive_win_count = 0
-                            else:
-                                consecutive_win_count += 1
-                                consecutive_sl_count = 0
 
-                # 3. AUTOMATIC TRADE ENTRY EXECUTION
-                elif (
-                    not pos_active
-                    and signal in ["CE", "PE"]
-                    and not algo_paused
-                    and is_new_entry_allowed()
-                ):
-                    sym, tok = get_itm_symbol_and_token(close, signal)
-                    if sym and tok:
-                        opt_ltp = get_live_ltp(tok, sym)
-                        if opt_ltp is None:
-                            opt_data = smartApi.ltpData("NFO", sym, tok)
-                            if (
-                                opt_data
-                                and opt_data.get("status")
-                                and "data" in opt_data
-                            ):
-                                opt_ltp = float(opt_data["data"]["ltp"])
+                # 3. AUTOMATIC TRADE ENTRY (Gated by Risk Rules)
+                elif not pos_active and signal in ["CE", "PE"] and not algo_paused and is_new_entry_allowed():
+                    # Risk Gates evaluated ONLY when considering new entries
+                    if daily_trades_count >= MAX_DAILY_TRADES:
+                        print(f"\r🛑 Max Daily Limit ({MAX_DAILY_TRADES} Trades) Reached.", end="", flush=True)
+                    elif consecutive_sl_count >= 2:
+                        print("\r🛑 2 Consecutive Losses Hit! No new entries today.", end="", flush=True)
+                    elif consecutive_win_count >= 3:
+                        print("\r🎉 3 Consecutive Profits Hit! Target Met, Entries Paused.", end="", flush=True)
+                    else:
+                        sym, tok = get_itm_symbol_and_token(close, signal)
+                        if sym and tok:
+                            opt_ltp = get_live_ltp(tok, sym)
+                            if opt_ltp is None:
+                                opt_data = smartApi.ltpData("NFO", sym, tok)
+                                if opt_data and opt_data.get("status") and "data" in opt_data:
+                                    opt_ltp = float(opt_data["data"]["ltp"])
 
-                        if opt_ltp and opt_ltp > 0:
-                            qty = calculate_dynamic_quantity(opt_ltp)
-                            order_id = place_order(sym, tok, "BUY", qty)
-                            if order_id:
-                                active_symbol = sym
-                                active_token = tok
-                                entry_price = opt_ltp
-                                sl_price = round(opt_ltp * (1 - SL_PCT), 2)
-                                tgt_price = round(opt_ltp * (1 + TARGET_PCT), 2)
-                                highest_price_seen = opt_ltp
-                                active_quantity = qty
-                                trade_entry_time = datetime.now()
-                                pos_active = True
+                            if opt_ltp and opt_ltp > 0:
+                                qty = calculate_dynamic_quantity(opt_ltp)
+                                order_id = place_order(sym, tok, "BUY", qty)
+                                if order_id:
+                                    active_symbol = sym
+                                    active_token = tok
+                                    entry_price = opt_ltp
+                                    sl_price = round(opt_ltp * (1 - SL_PCT), 2)
+                                    tgt_price = round(opt_ltp * (1 + TARGET_PCT), 2)
+                                    highest_price_seen = opt_ltp
+                                    active_quantity = qty
+                                    trade_entry_time = datetime.now()
+                                    pos_active = True
 
-                                setup_and_subscribe_websocket(tok)
-                                send_telegram_alert(
-                                    f"🚀 <b>NEW AUTO-TRADE ENTERED ({signal})</b>\n"
-                                    f"<b>Symbol:</b> {sym}\n"
-                                    f"<b>Entry Price:</b> ₹{entry_price:.2f}\n"
-                                    f"<b>SL:</b> ₹{sl_price:.2f}\n"
-                                    f"<b>Target:</b> ₹{tgt_price:.2f}\n"
-                                    f"<b>Qty:</b> {qty}"
-                                )
+                                    setup_and_subscribe_websocket(tok)
+                                    send_telegram_alert(
+                                        f"🚀 <b>NEW AUTO-TRADE ENTERED ({signal})</b>\n"
+                                        f"<b>Symbol:</b> {sym}\n"
+                                        f"<b>Entry Price:</b> ₹{entry_price:.2f}\n"
+                                        f"<b>SL:</b> ₹{sl_price:.2f}\n"
+                                        f"<b>Target:</b> ₹{tgt_price:.2f}\n"
+                                        f"<b>Qty:</b> {qty}"
+                                    )
         else:
-            print(
-                "\r⏸️ Market Closed. Waiting for market session...",
-                end="",
-                flush=True,
-            )
+            print("\r⏸️ Market Closed. Waiting for market session...", end="", flush=True)
             time.sleep(10)
 
         time.sleep(3)
