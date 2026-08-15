@@ -87,3 +87,4 @@ def fetch_today_full_history():
 
 if __name__ == "__main__":
     fetch_today_full_history()
+    run: |
