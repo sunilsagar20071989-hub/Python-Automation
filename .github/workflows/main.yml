@@ -3,11 +3,17 @@ name: Run Python Automation Scripts
 on:
   workflow_dispatch:
   schedule:
-    - cron: '15 3 * * 1-5'
+    - cron: '15 3 * * 1-5' # Market hours trigger (09:00 AM IST)
 
 jobs:
   run-automation:
     runs-on: ubuntu-latest
+
+    env:
+      SMARTAPI_API_KEY: ${{ secrets.SMARTAPI_API_KEY }}
+      SMARTAPI_CLIENT_CODE: ${{ secrets.SMARTAPI_CLIENT_CODE }}
+      SMARTAPI_PIN: ${{ secrets.SMARTAPI_PIN }}
+      SMARTAPI_TOTP_SECRET: ${{ secrets.SMARTAPI_TOTP_SECRET }}
 
     steps:
       - name: Check out repo code
@@ -21,15 +27,15 @@ jobs:
       - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install requests pandas telebot smartapi-python pyotp ta
+          pip install requests pandas telebot smartapi-python pyotp ta logzero
 
       - name: Execute All Python Scripts
         run: |
-          python advanced_stock_screener.py
-          python backtest.py
-          python fetch_trades.py
-          python fno_option_15min_screener.py
-          python nifty_algo.py
-          python nifty_algo_paper.py
-          python nifty_stock_fno_master_screener.py
-          python telegram_bot.py
+          python advanced_stock_screener.py || true
+          python backtest.py || true
+          python fetch_trades.py || true
+          python fno_option_15min_screener.py || true
+          python nifty_algo.py || true
+          python nifty_algo_paper.py || true
+          python nifty_stock_fno_master_screener.py || true
+          python telegram_bot.py || true
