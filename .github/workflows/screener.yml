@@ -21,7 +21,7 @@ jobs:
     - name: Install Required Libraries
       run: |
         python -m pip install --upgrade pip
-        pip install pandas pyotp ta requests smartapi-python python-dotenv
+        pip install pandas pyotp ta requests logzero smartapi-python python-dotenv websocket-client
 
     - name: Execute All Trading & Screening Scripts
       env:
