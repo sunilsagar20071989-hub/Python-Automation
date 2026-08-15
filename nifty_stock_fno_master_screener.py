@@ -22,27 +22,25 @@ logger = logging.getLogger("StockScreener")
 # ==========================================
 # 1. CONFIGURATION & SECURE ENVIRONMENT VARIABLES
 # ==========================================
-# `.env` file load karein
+# `.env` file load karein (agar locally run ho raha ho)
 load_dotenv()
 
-# Fallback ke saath environment variables read karein
-API_KEY = os.getenv("SMARTAPI_KEY", "N7XNbnkE")
-CLIENT_CODE = os.getenv("SMARTAPI_CLIENT_CODE", "S885143")
-PIN = os.getenv("SMARTAPI_PIN", "1989")
-TOTP_SECRET = os.getenv("SMARTAPI_TOTP_SECRET", "ZH76UOCDHM4TITQGDKN32HBZEI")
+# GitHub Secrets aur System Env variables ko priority dene ke liye fallback handling
+API_KEY = os.getenv("SMARTAPI_API_KEY") or os.getenv("SMARTAPI_KEY") or os.getenv("API_KEY")
+CLIENT_CODE = os.getenv("SMARTAPI_CLIENT_CODE") or os.getenv("CLIENT_CODE")
+PIN = os.getenv("SMARTAPI_PIN") or os.getenv("PIN")
+TOTP_SECRET = os.getenv("SMARTAPI_TOTP_SECRET") or os.getenv("TOTP_SECRET")
 
-TELEGRAM_BOT_TOKEN = os.getenv(
-    "TELEGRAM_BOT_TOKEN", "8560792327:AAErjHTU4LlKxlueD4c-EXxS2KcqVwBrDN8"
-)
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "1427460047")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("TELEGRAM_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID") or os.getenv("CHAT_ID")
 
 # STRATEGY THRESHOLDS (Strict Momentum Criteria)
-MIN_RSI = 60.0        # RSI must be >= 60
-MIN_ROC = 0.0        # ROC must be > 0
+MIN_RSI = 60.0         # RSI must be >= 60
+MIN_ROC = 0.0          # ROC must be > 0
 ENABLE_EMA_FILTER = True  # Enforce EMA 9 > EMA 21 & Close > EMA 44
 
 # RISK PARAMETERS
-SL_PCT = 0.045       # 4.5% Initial Stop Loss
+SL_PCT = 0.045        # 4.5% Initial Stop Loss
 TARGET_PCT = 0.1575   # 15.75% Target Gain
 MAX_RISK_PER_TRADE_PCT = 0.015  # Max 1.5% account capital risk per stock
 
@@ -143,6 +141,8 @@ def initialize_smartapi():
             auth_token = raw_token if raw_token.startswith("Bearer ") else f"Bearer {raw_token}"
             logger.info(">>> SmartAPI Authenticated Successfully!")
             return auth_token
+        else:
+            logger.error(f"SmartAPI Authentication Failed: {data}")
     except Exception as e:
         logger.error(f"Authentication Exception: {e}")
     return None
@@ -188,9 +188,8 @@ def fetch_candle_data_direct(auth_token, token, interval, days, exchange="NSE"):
     }
 
     now = datetime.now()
-    last_trade_date = now - timedelta(days=1) if now.hour < 9 else now
-    to_date = last_trade_date.strftime("%Y-%m-%d 15:30")
-    from_date = (last_trade_date - timedelta(days=days)).strftime("%Y-%m-%d 09:15")
+    to_date = now.strftime("%Y-%m-%d 15:30")
+    from_date = (now - timedelta(days=days)).strftime("%Y-%m-%d 09:15")
 
     payload = {
         "exchange": exchange,
@@ -293,7 +292,7 @@ def scan_fno_universe(auth_token):
                     f"<b>Volume Surge:</b> {'YES ⚡' if vol_pass else 'NO'}\n\n"
                     f"<b>Suggested Qty:</b> {qty}\n"
                     f"<b>Stop Loss (4.5%):</b> ₹{initial_sl}\n"
-                    f"<b>Target (12.5%):</b> ₹{tgt_p}"
+                    f"<b>Target (15.75%):</b> ₹{tgt_p}"
                 )
                 send_telegram_alert(tg_msg)
 
@@ -319,7 +318,7 @@ def main():
     auth_token = initialize_smartapi()
     if not auth_token:
         logger.error("Session initialization failed. Exiting.")
-        return
+        sys.exit(1)
 
     send_telegram_alert("🔍 <b>F&O Stock Master Screener Started!</b> Scanning sectors...")
     all_scanned, qualified_matches = scan_fno_universe(auth_token)
@@ -346,7 +345,6 @@ def main():
         print(">>> ZERO STOCKS MATCHED STRICT RSI + ROC + EMA FILTERS TODAY.")
         send_telegram_alert("ℹ️ <b>Scan Complete!</b> No stocks matched strict RSI+ROC filters today.")
     print("=" * 95 + "\n")
-
 
 if __name__ == "__main__":
     main()
