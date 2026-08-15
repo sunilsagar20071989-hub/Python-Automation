@@ -307,3 +307,4 @@ while True:
     except Exception as e:
         print("Loop Exception:", e)
         time.sleep(5)
+        run: |
