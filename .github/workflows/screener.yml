@@ -1,9 +1,9 @@
 name: Automated FNO & Nifty Strategy Pipeline
 
 on:
-  workflow_dispatch: # Manual Run button ke liye
+  workflow_dispatch:
   schedule:
-    - cron: '30 3 * * 1-5' # Indian Standard Time (IST) 9:00 AM (Mon-Fri)
+    - cron: '30 3 * * 1-5'
 
 jobs:
   run-all-strategies:
@@ -25,12 +25,36 @@ jobs:
 
     - name: Execute All Trading & Screening Scripts
       env:
-        SMARTAPI_KEY: ${{ secrets.SMARTAPI_KEY }}
-        CLIENT_CODE: ${{ secrets.CLIENT_CODE }}
-        PIN: ${{ secrets.PIN }}
-        TOTP_SECRET: ${{ secrets.TOTP_SECRET }}
-        TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+        # SmartAPI Key Mappings
+        SMARTAPI_API_KEY: ${{ secrets.SMARTAPI_API_KEY }}
+        SMARTAPI_KEY: ${{ secrets.SMARTAPI_API_KEY }}
+        API_KEY: ${{ secrets.SMARTAPI_API_KEY }}
+        ANGEL_API_KEY: ${{ secrets.SMARTAPI_API_KEY }}
+        
+        # Client Code Mappings
+        SMARTAPI_CLIENT_CODE: ${{ secrets.SMARTAPI_CLIENT_CODE }}
+        CLIENT_CODE: ${{ secrets.SMARTAPI_CLIENT_CODE }}
+        USER_ID: ${{ secrets.SMARTAPI_CLIENT_CODE }}
+        ANGEL_CLIENT_CODE: ${{ secrets.SMARTAPI_CLIENT_CODE }}
+        
+        # PIN Mappings
+        SMARTAPI_PIN: ${{ secrets.SMARTAPI_PIN }}
+        PIN: ${{ secrets.SMARTAPI_PIN }}
+        PWD: ${{ secrets.SMARTAPI_PIN }}
+        PASSWORD: ${{ secrets.SMARTAPI_PIN }}
+        
+        # TOTP Mappings
+        SMARTAPI_TOTP_SECRET: ${{ secrets.SMARTAPI_TOTP_SECRET }}
+        TOTP_SECRET: ${{ secrets.SMARTAPI_TOTP_SECRET }}
+        TOKEN: ${{ secrets.SMARTAPI_TOTP_SECRET }}
+        TOTP_KEY: ${{ secrets.SMARTAPI_TOTP_SECRET }}
+        
+        # Telegram Mappings
+        TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+        TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+        BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
         TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
       run: |
         python nifty_stock_fno_master_screener.py
         python fno_option_15min_screener.py
