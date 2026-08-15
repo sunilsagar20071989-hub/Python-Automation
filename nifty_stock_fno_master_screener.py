@@ -1,325 +1,352 @@
-import time
-from datetime import datetime, timedelta
-import pandas as pd
-import pyotp
-import requests
-import ta
+# ==============================================================================
+# F&O STOCKS MASTER SCREENER & TELEGRAM ALERT BOT (COMPLETE SINGLE FILE)
+# ==============================================================================
+
 import os
+import sys
+import time
+import math
+import logging
+from dotenv import load_dotenv
+import requests
+import pyotp
+import pandas as pd
+import ta
+from datetime import datetime, timedelta
 from SmartApi import SmartConnect
 
-# ==========================================
-# 1. CONFIGURATION & CREDENTIALS
-# ==========================================
-API_KEY = "N7XNbnkE"
-CLIENT_CODE = "S885143"
-PIN = "1989"
-TOTP_SECRET = "ZH76UOCDHM4TITQGDKN32HBZEI"
-
-# NIFTY 50 INDEX SYMBOL & TOKEN
-NIFTY_INDEX = {"symbol": "NIFTY 50", "token": "99926000", "exchange": "NSE"}
-
-# CASH EQUITY STOCKS UNIVERSE
-CASH_STOCK_UNIVERSE = [
-    {"symbol": "TCS-EQ", "token": "11536"}, {"symbol": "INFY-EQ", "token": "1594"},
-    {"symbol": "RELIANCE-EQ", "token": "2885"}, {"symbol": "BAJAJ-AUTO-EQ", "token": "16669"},
-    {"symbol": "SUNPHARMA-EQ", "token": "3351"}, {"symbol": "ICICIBANK-EQ", "token": "4963"},
-    {"symbol": "SBIN-EQ", "token": "3045"}, {"symbol": "HDFCBANK-EQ", "token": "1333"}
-]
-
-# F&O OPTION STOCKS UNIVERSE
-FNO_OPTION_UNIVERSE = [
-    {"symbol": "SUNPHARMA-EQ", "token": "3351"}, {"symbol": "BAJAJ-AUTO-EQ", "token": "16669"},
-    {"symbol": "RELIANCE-EQ", "token": "2885"}, {"symbol": "TCS-EQ", "token": "11536"},
-    {"symbol": "INFY-EQ", "token": "1594"}, {"symbol": "ICICIBANK-EQ", "token": "4963"},
-    {"symbol": "SBIN-EQ", "token": "3045"}, {"symbol": "HDFCBANK-EQ", "token": "1333"},
-    {"symbol": "M&M-EQ", "token": "2031"}, {"symbol": "TATAMOTORS-EQ", "token": "3456"}
-]
+# Logging Setup
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logger = logging.getLogger("StockScreener")
 
 # ==========================================
-# 2. AUTHENTICATION & API HELPERS
+# 1. CONFIGURATION & SECURE ENVIRONMENT VARIABLES
+# ==========================================
+# `.env` file load karein
+load_dotenv()
+
+# Fallback ke saath environment variables read karein
+API_KEY = os.getenv("SMARTAPI_KEY", "N7XNbnkE")
+CLIENT_CODE = os.getenv("SMARTAPI_CLIENT_CODE", "S885143")
+PIN = os.getenv("SMARTAPI_PIN", "1989")
+TOTP_SECRET = os.getenv("SMARTAPI_TOTP_SECRET", "ZH76UOCDHM4TITQGDKN32HBZEI")
+
+TELEGRAM_BOT_TOKEN = os.getenv(
+    "TELEGRAM_BOT_TOKEN", "8560792327:AAErjHTU4LlKxlueD4c-EXxS2KcqVwBrDN8"
+)
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "1427460047")
+
+# STRATEGY THRESHOLDS (Strict Momentum Criteria)
+MIN_RSI = 60.0        # RSI must be >= 60
+MIN_ROC = 0.0        # ROC must be > 0
+ENABLE_EMA_FILTER = True  # Enforce EMA 9 > EMA 21 & Close > EMA 44
+
+# RISK PARAMETERS
+SL_PCT = 0.045       # 4.5% Initial Stop Loss
+TARGET_PCT = 0.1575   # 15.75% Target Gain
+MAX_RISK_PER_TRADE_PCT = 0.015  # Max 1.5% account capital risk per stock
+
+LOG_FILE = "fno_scan_log.csv"
+
+# F&O UNIVERSE BY SECTOR
+FNO_UNIVERSE_BY_SECTOR = {
+    "IT": [
+        {"symbol": "TCS-EQ", "token": "11536"},
+        {"symbol": "INFY-EQ", "token": "1594"},
+        {"symbol": "PERSISTENT-EQ", "token": "18365"},
+        {"symbol": "HCLTECH-EQ", "token": "7229"},
+        {"symbol": "WIPRO-EQ", "token": "3787"},
+        {"symbol": "COFORGE-EQ", "token": "11543"},
+        {"symbol": "TECHM-EQ", "token": "13538"},
+        {"symbol": "LTIM-EQ", "token": "17818"},
+    ],
+    "Auto": [
+        {"symbol": "BAJAJ-AUTO-EQ", "token": "16669"},
+        {"symbol": "M&M-EQ", "token": "2031"},
+        {"symbol": "MARUTI-EQ", "token": "10999"},
+        {"symbol": "TATAMOTORS-EQ", "token": "3456"},
+        {"symbol": "HEROMOTOCO-EQ", "token": "1348"},
+        {"symbol": "TVSMOTOR-EQ", "token": "8479"},
+        {"symbol": "EICHERMOT-EQ", "token": "910"},
+        {"symbol": "BHARATFORG-EQ", "token": "422"},
+    ],
+    "Pharma": [
+        {"symbol": "SUNPHARMA-EQ", "token": "3351"},
+        {"symbol": "CIPLA-EQ", "token": "694"},
+        {"symbol": "DRREDDY-EQ", "token": "881"},
+        {"symbol": "LUPIN-EQ", "token": "10440"},
+        {"symbol": "DIVISLAB-EQ", "token": "10940"},
+        {"symbol": "TORNTPHARM-EQ", "token": "3518"},
+    ],
+    "Banking": [
+        {"symbol": "ICICIBANK-EQ", "token": "4963"},
+        {"symbol": "SBIN-EQ", "token": "3045"},
+        {"symbol": "HDFCBANK-EQ", "token": "1333"},
+        {"symbol": "AXISBANK-EQ", "token": "5900"},
+        {"symbol": "KOTAKBANK-EQ", "token": "1922"},
+        {"symbol": "INDUSINDBK-EQ", "token": "5258"},
+    ],
+    "Metal": [
+        {"symbol": "TATASTEEL-EQ", "token": "3499"},
+        {"symbol": "HINDALCO-EQ", "token": "1363"},
+        {"symbol": "JINDALSTEL-EQ", "token": "1732"},
+        {"symbol": "VEDL-EQ", "token": "3063"},
+    ],
+    "Energy": [
+        {"symbol": "RELIANCE-EQ", "token": "2885"},
+        {"symbol": "NTPC-EQ", "token": "11630"},
+        {"symbol": "POWERGRID-EQ", "token": "14977"},
+        {"symbol": "ONGC-EQ", "token": "2475"},
+    ],
+}
+
+smart_api_instance = None
+
+
+# ==========================================
+# 2. TELEGRAM NOTIFICATION ENGINE
+# ==========================================
+def send_telegram_alert(message):
+    """Sends HTML formatted Telegram notifications"""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        logger.warning("Telegram Bot Token ya Chat ID missing hai.")
+        return
+    
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": message,
+        "parse_mode": "HTML"
+    }
+    try:
+        requests.post(url, data=payload, timeout=10)
+    except Exception as e:
+        logger.error(f"Telegram Alert Exception: {e}")
+
+
+# ==========================================
+# 3. LOGIN & AUTHENTICATION
 # ==========================================
 def initialize_smartapi():
+    global smart_api_instance
     try:
-        smart_api = SmartConnect(api_key=API_KEY)
+        if not all([API_KEY, CLIENT_CODE, PIN, TOTP_SECRET]):
+            logger.error("SmartAPI Credentials missing hain!")
+            return None
+
+        smart_api_instance = SmartConnect(api_key=API_KEY)
         totp_code = pyotp.TOTP(TOTP_SECRET).now()
-        data = smart_api.generateSession(CLIENT_CODE, PIN, totp_code)
-        if data and data.get('status'):
-            raw_token = data['data']['jwtToken']
-            return raw_token if raw_token.startswith("Bearer ") else f"Bearer {raw_token}"
+        data = smart_api_instance.generateSession(CLIENT_CODE, PIN, totp_code)
+
+        if data and data.get("status"):
+            raw_token = data["data"]["jwtToken"]
+            auth_token = raw_token if raw_token.startswith("Bearer ") else f"Bearer {raw_token}"
+            logger.info(">>> SmartAPI Authenticated Successfully!")
+            return auth_token
     except Exception as e:
-        print(">>> Authentication Exception:", e)
+        logger.error(f"Authentication Exception: {e}")
     return None
 
-def fetch_candle_data(auth_token, token, interval, days_back, exchange="NSE"):
-    url = "https://apiconnect.angelone.in/rest/secure/angelbroking/historical/v1/getCandleData"
-    headers = {
-        "Content-Type": "application/json", "Accept": "application/json",
-        "X-PrivateKey": API_KEY, "X-UserType": "USER", "X-SourceID": "WEB",
-        "X-ClientLocalIP": "127.0.0.1", "X-ClientPublicIP": "106.193.147.98", "X-MACAddress": "00:2b:67:30:5e:99",
-        "Authorization": auth_token
-    }
-    now = datetime.now()
-    payload = {
-        "exchange": exchange, "symboltoken": str(token), "interval": interval,
-        "fromdate": (now - timedelta(days=days_back)).strftime("%Y-%m-%d 09:15"),
-        "todate": now.strftime("%Y-%m-%d %H:%M")
-    }
+
+# ==========================================
+# 4. DYNAMIC POSITION SIZING
+# ==========================================
+def calculate_dynamic_position_size(entry_price):
+    """Calculates quantity based on account capital risk"""
     try:
-        resp = requests.post(url, headers=headers, json=payload, timeout=8).json()
-        if resp.get('status') and resp.get('data'):
-            df = pd.DataFrame(resp['data'], columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-            df['open'] = df['open'].astype(float)
-            df['high'] = df['high'].astype(float)
-            df['low'] = df['low'].astype(float)
-            df['close'] = df['close'].astype(float)
+        if smart_api_instance:
+            rms_data = smart_api_instance.rmsLimit()
+            if rms_data and rms_data.get("status") and "data" in rms_data:
+                net_capital = float(rms_data["data"].get("net", 0.0))
+                if net_capital > 0:
+                    max_risk_amount = net_capital * MAX_RISK_PER_TRADE_PCT
+                    risk_per_share = entry_price * SL_PCT
+                    quantity = int(max_risk_amount // risk_per_share)
+                    return max(1, quantity), net_capital
+    except Exception as e:
+        logger.error(f"Error Fetching RMS Data: {e}")
+
+    return 10, 0.0
+
+
+# ==========================================
+# 5. HISTORICAL DATA FETCH
+# ==========================================
+def fetch_candle_data_direct(auth_token, token, interval, days, exchange="NSE"):
+    url = "https://apiconnect.angelone.in/rest/secure/angelbroking/historical/v1/getCandleData"
+
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "X-PrivateKey": API_KEY,
+        "X-UserType": "USER",
+        "X-SourceID": "WEB",
+        "X-ClientLocalIP": "127.0.0.1",
+        "X-ClientPublicIP": "127.0.0.1",
+        "X-MACAddress": "MAC_ADDRESS",
+        "Authorization": auth_token,
+    }
+
+    now = datetime.now()
+    last_trade_date = now - timedelta(days=1) if now.hour < 9 else now
+    to_date = last_trade_date.strftime("%Y-%m-%d 15:30")
+    from_date = (last_trade_date - timedelta(days=days)).strftime("%Y-%m-%d 09:15")
+
+    payload = {
+        "exchange": exchange,
+        "symboltoken": str(token),
+        "interval": interval,
+        "fromdate": from_date,
+        "todate": to_date,
+    }
+
+    try:
+        resp = requests.post(url, headers=headers, json=payload, timeout=8)
+        resp_json = resp.json()
+
+        if resp_json.get("status") and resp_json.get("data"):
+            df = pd.DataFrame(
+                resp_json["data"],
+                columns=["timestamp", "open", "high", "low", "close", "volume"],
+            )
+            df["close"] = df["close"].astype(float)
+            df["volume"] = df["volume"].astype(float)
             return df
     except Exception:
         pass
     return None
 
-# ==========================================
-# 3. MODULE 1: NIFTY INDEX LIVE ANALYZER
-# ==========================================
-def run_nifty_analyzer(auth_token):
-    print("\n" + "="*95)
-    print(">>> RUNNING MODULE 1: NIFTY 50 INDEX LIVE ANALYZER...")
-    print("="*95)
-    
-    df = fetch_candle_data(auth_token, NIFTY_INDEX['token'], "FIFTEEN_MINUTE", 5, exchange="NSE")
-    if df is None or len(df) < 15:
-        print("❌ Unable to fetch Nifty Index candles.")
-        return
-
-    df['rsi'] = ta.momentum.rsi(df['close'], window=14)
-    df['roc'] = ta.momentum.roc(df['close'], window=12)
-    curr = df.iloc[-1]
-
-    rsi_val = round(curr['rsi'], 2) if not pd.isna(curr['rsi']) else 50.0
-    roc_val = round(curr['roc'], 2) if not pd.isna(curr['roc']) else 0.0
-    ltp = round(curr['close'], 2)
-
-    if rsi_val >= 60.0 and roc_val > 0:
-        bias = "🔥 BULLISH MOMENTUM (CE Bias)"
-    elif rsi_val <= 40.0 and roc_val < 0:
-        bias = "🔻 BEARISH MOMENTUM (PE Bias)"
-    else:
-        bias = "⚠️ SIDEWAYS / CONSOLIDATION"
-
-    nifty_log = [{
-        "Time": datetime.now().strftime("%H:%M:%S"),
-        "Symbol": "NIFTY 50", "Token": NIFTY_INDEX['token'],
-        "Live_LTP": ltp, "RSI_15M": rsi_val, "ROC_15M": roc_val, "Market_Bias": bias
-    }]
-
-    df_nifty = pd.DataFrame(nifty_log)
-    df_nifty.to_csv("nifty_index_logs.csv", index=False)
-    print(">>> [LOG SAVED] Nifty status saved to 'nifty_index_logs.csv'")
-    print(df_nifty.to_string(index=False))
 
 # ==========================================
-# 4. MODULE 2: DAILY CASH STOCK SCREENER
+# 6. STOCK SCANNER ENGINE & TELEGRAM ALERTS
 # ==========================================
-def run_daily_stock_screener(auth_token):
-    print("\n" + "="*95)
-    print(">>> RUNNING MODULE 2: DAILY STOCK SCREENER...")
-    print("="*95)
-    
-    matches = []
-    for st in CASH_STOCK_UNIVERSE:
-        df = fetch_candle_data(auth_token, st['token'], "ONE_DAY", 100)
-        if df is None or len(df) < 30: continue
-        
-        df['rsi'] = ta.momentum.rsi(df['close'], window=14)
-        df['roc'] = ta.momentum.roc(df['close'], window=12)
-        curr = df.iloc[-1]
-        
-        if curr['rsi'] >= 60.0 and curr['roc'] > 0.0:
-            matches.append({
-                "Date": datetime.now().strftime("%Y-%m-%d"),
-                "Symbol": st['symbol'], "Token": st['token'],
-                "Entry_Price": round(curr['close'], 2),
-                "Stop_Loss": round(curr['close'] * 0.985, 2),
-                "Target": round(curr['close'] * 1.03, 2),
-                "Reason": f"Daily RSI ({round(curr['rsi'],1)}) >= 60 & ROC > 0"
-            })
-        time.sleep(0.05)
+def scan_fno_universe(auth_token):
+    logger.info(">>> Scanning F&O Stocks with Momentum Filters...")
+    all_scanned = []
+    qualified_matches = []
 
-    if matches:
-        df_match = pd.DataFrame(matches)
-        df_match.to_csv("stock_screener_logs.csv", index=False)
-        print(">>> [LOG SAVED] Candidates saved to 'stock_screener_logs.csv'")
-        print(df_match.to_string(index=False))
-    else:
-        print(">>> No stocks matched today's Daily criteria.")
+    for sector_name, stock_list in FNO_UNIVERSE_BY_SECTOR.items():
+        print(f" Scanning [{sector_name} Sector] ({len(stock_list)} F&O stocks)...")
 
-# ==========================================
-# 5. MODULE 3: 15-MIN F&O OPTION SCREENER
-# ==========================================
-def run_15min_fno_screener(auth_token):
-    print("\n" + "="*95)
-    print(">>> RUNNING MODULE 3: 15-MIN F&O LIVE OPTION SCREENER...")
-    print("="*95)
-    
-    matches = []
-    for st in FNO_OPTION_UNIVERSE:
-        df = fetch_candle_data(auth_token, st['token'], "FIFTEEN_MINUTE", 5)
-        if df is None or len(df) < 15: continue
-        
-        df['rsi'] = ta.momentum.rsi(df['close'], window=14)
-        df['roc'] = ta.momentum.roc(df['close'], window=12)
-        curr = df.iloc[-1]
-        
-        is_open_equal_low = abs(curr['open'] - curr['low']) <= (curr['close'] * 0.0008)
-        is_open_equal_high = abs(curr['open'] - curr['high']) <= (curr['close'] * 0.0008)
+        for stock in stock_list:
+            symbol = stock["symbol"]
+            token = stock["token"]
 
-        is_bullish = (curr['rsi'] >= 60.0) and (curr['roc'] > 0.0)
-        is_bearish = (curr['rsi'] <= 40.0) and (curr['roc'] < 0.0)
-        
-        if is_bullish:
-            sl = round(curr['low'], 2)
-            risk = curr['close'] - sl
-            matches.append({
-                "Time": datetime.now().strftime("%H:%M:%S"),
-                "Symbol": st['symbol'], "Token": st['token'],
-                "Action": "BUY CALL (CE)", "Entry_Price": round(curr['close'], 2),
-                "Stop_Loss": sl, "Target": round(curr['close'] + (risk * 2), 2),
-                "OHLC_Match": "OPEN=LOW" if is_open_equal_low else "MOMENTUM_BREAKOUT",
-                "Reason": f"15M RSI ({round(curr['rsi'],1)}) >= 60 & ROC > 0"
-            })
-        elif is_bearish:
-            sl = round(curr['high'], 2)
-            risk = sl - curr['close']
-            matches.append({
-                "Time": datetime.now().strftime("%H:%M:%S"),
-                "Symbol": st['symbol'], "Token": st['token'],
-                "Action": "BUY PUT (PE)", "Entry_Price": round(curr['close'], 2),
-                "Stop_Loss": sl, "Target": round(curr['close'] - (risk * 2), 2),
-                "OHLC_Match": "OPEN=HIGH" if is_open_equal_high else "BEARISH_BREAKOUT",
-                "Reason": f"15M RSI ({round(curr['rsi'],1)}) <= 40 & ROC < 0"
-            })
-        time.sleep(0.05)
-
-    if matches:
-        df_match = pd.DataFrame(matches)
-        df_match.to_csv("fno_15min_option_logs.csv", index=False)
-        print(">>> [LOG SAVED] Candidates saved to 'fno_15min_option_logs.csv'")
-        print(df_match.to_string(index=False))
-    else:
-        print(">>> No 15-min option setups matched right now.")
-
-# ==========================================
-# 6. MODULE 4: SAFE PERFORMANCE & MOVEMENT TRACKER
-# ==========================================
-def run_performance_tracker(auth_token):
-    print("\n" + "="*95)
-    print(">>> RUNNING MODULE 4: COMBINED PERFORMANCE & MOVEMENT TRACKER...")
-    print("="*95)
-
-    def evaluate_file(csv_file, title):
-        if not os.path.exists(csv_file):
-            print(f"⚠️ Log file '{csv_file}' not found.")
-            return
-
-        df = pd.read_csv(csv_file)
-        print(f"\n--- 📊 PERFORMANCE REPORT: {title} ---")
-
-        for idx, row in df.iterrows():
-            token = row.get('Token')
-            symbol = row.get('Symbol', row.get('Index', 'NIFTY'))
-            
-            # Safe Check for Nifty Bias File
-            if 'Entry_Price' not in row:
-                print(f"📌 NIFTY BIAS LOGGED: {row.get('Market_Bias')} | LTP: {row.get('Live_LTP')} | RSI: {row.get('RSI_15M')}")
+            df_daily = fetch_candle_data_direct(auth_token, token, "ONE_DAY", days=100)
+            if df_daily is None or len(df_daily) < 45:
                 continue
 
-            entry = float(row['Entry_Price'])
-            sl = float(row['Stop_Loss'])
-            target = float(row['Target'])
-            action = row.get('Action', 'BUY CALL (CE)')
+            # Compute Technical Indicators
+            df_daily["rsi"] = ta.momentum.rsi(df_daily["close"], window=14)
+            df_daily["roc"] = ta.momentum.roc(df_daily["close"], window=12)
+            df_daily["ema_9"] = ta.trend.ema_indicator(df_daily["close"], window=9)
+            df_daily["ema_21"] = ta.trend.ema_indicator(df_daily["close"], window=21)
+            df_daily["ema_44"] = ta.trend.ema_indicator(df_daily["close"], window=44)
+            df_daily["vol_sma20"] = df_daily["volume"].rolling(window=20).mean()
 
-            df_day = fetch_candle_data(auth_token, token, "ONE_DAY", 1)
-            if df_day is None or len(df_day) == 0:
-                print(f"❌ Could not fetch live data for {symbol}")
-                continue
+            curr = df_daily.iloc[-1]
+            entry_p = round(curr["close"], 2)
 
-            last = df_day.iloc[-1]
-            high, low, close = last['high'], last['low'], last['close']
-            
-            if "CALL" in str(action) or "BUY" in str(action):
-                max_up_move = round(((high - entry) / entry) * 100, 2)
-                if high >= target:
-                    status = "🎯 TARGET HIT"
-                    behind_reason = f"High touched {high} (+{max_up_move}% move). Strong buyer momentum."
-                elif low <= sl:
-                    status = "❌ STOP LOSS HIT"
-                    behind_reason = f"Low touched {low}. Reversal due to selling pressure."
-                else:
-                    status = "🟢 PROFIT / IN PROGRESS" if close > entry else "🔴 LOSS / IN PROGRESS"
-                    behind_reason = f"Closed at {close}. Max up-move reached: +{max_up_move}%."
-            else:
-                max_down_move = round(((entry - low) / entry) * 100, 2)
-                if low <= target:
-                    status = "🎯 TARGET HIT"
-                    behind_reason = f"Low touched {low} (+{max_down_move}% PE move). Heavy downside expansion."
-                elif high >= sl:
-                    status = "❌ STOP LOSS HIT"
-                    behind_reason = f"High touched {high}. Short squeeze occurred."
-                else:
-                    status = "🟢 PROFIT / IN PROGRESS" if close < entry else "🔴 LOSS / IN PROGRESS"
-                    behind_reason = f"Closed at {close}. Max PE gain move: +{max_down_move}%."
+            # Conditions Check
+            rsi_pass = curr["rsi"] >= MIN_RSI
+            roc_pass = curr["roc"] > MIN_ROC
+            ema_pass = (
+                (curr["ema_9"] > curr["ema_21"]) and (curr["close"] > curr["ema_44"])
+                if ENABLE_EMA_FILTER
+                else True
+            )
+            vol_pass = curr["volume"] > curr["vol_sma20"]
 
-            print(f"\n📌 ASSET: {symbol} | Setup: {action} | Entry: {entry} | SL: {sl} | Target: {target}")
-            print(f"   • Outcome Status: {status}")
-            print(f"   • Movement Analysis: {behind_reason}")
+            status_data = {
+                "Sector": sector_name,
+                "Symbol": symbol,
+                "LTP": entry_p,
+                "RSI(14)": round(curr["rsi"], 2),
+                "ROC(12)": round(curr["roc"], 2),
+                "RSI_>=_60": "PASS" if rsi_pass else "FAIL",
+                "ROC_>_0": "PASS" if roc_pass else "FAIL",
+                "EMA_Trend": "PASS" if ema_pass else "FAIL",
+                "VolSurge": "YES" if vol_pass else "NO",
+            }
+            all_scanned.append(status_data)
+
+            # Push to Telegram if all criteria match
+            if rsi_pass and roc_pass and ema_pass:
+                qty, capital = calculate_dynamic_position_size(entry_p)
+                initial_sl = round(entry_p * (1 - SL_PCT), 2)
+                tgt_p = round(entry_p * (1 + TARGET_PCT), 2)
+
+                match_data = status_data.copy()
+                match_data["Signal"] = "🚀 MOMENTUM BUY"
+                match_data["Alloc_Qty"] = qty
+                match_data["Initial_SL"] = initial_sl
+                match_data["Target"] = tgt_p
+                qualified_matches.append(match_data)
+
+                # Send Telegram Notification
+                tg_msg = (
+                    f"🎯 <b>F&O STOCK MOMENTUM SIGNAL</b>\n\n"
+                    f"<b>Stock:</b> {symbol} ({sector_name})\n"
+                    f"<b>LTP:</b> ₹{entry_p}\n"
+                    f"<b>RSI(14):</b> {round(curr['rsi'], 2)}\n"
+                    f"<b>ROC(12):</b> {round(curr['roc'], 2)}\n"
+                    f"<b>Volume Surge:</b> {'YES ⚡' if vol_pass else 'NO'}\n\n"
+                    f"<b>Suggested Qty:</b> {qty}\n"
+                    f"<b>Stop Loss (4.5%):</b> ₹{initial_sl}\n"
+                    f"<b>Target (12.5%):</b> ₹{tgt_p}"
+                )
+                send_telegram_alert(tg_msg)
+
             time.sleep(0.08)
 
-    evaluate_file("nifty_index_logs.csv", "NIFTY INDEX BIAS")
-    evaluate_file("stock_screener_logs.csv", "DAILY STOCK SCREENER")
-    evaluate_file("fno_15min_option_logs.csv", "15-MIN F&O OPTION SCREENER")
+    return all_scanned, qualified_matches
+
+
+def log_scan_results(qualified_matches):
+    """Exports scanned results into CSV file"""
+    if qualified_matches:
+        df_log = pd.DataFrame(qualified_matches)
+        df_log["Scan_Timestamp"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        file_exists = os.path.isfile(LOG_FILE)
+        df_log.to_csv(LOG_FILE, mode="a", header=not file_exists, index=False)
+        logger.info(f"Saved {len(qualified_matches)} setup(s) to {LOG_FILE}")
+
 
 # ==========================================
-# 7. MAIN INTERACTIVE MENU
+# 7. MAIN PIPELINE
 # ==========================================
 def main():
-    print("Connecting to SmartAPI Engine...")
     auth_token = initialize_smartapi()
     if not auth_token:
-        print(">>> Authentication failed! Check API Credentials.")
+        logger.error("Session initialization failed. Exiting.")
         return
 
-    while True:
-        print("\n" + "="*65)
-        print("    🚀 MASTER TRADING ENGINE: NIFTY + STOCKS + F&O")
-        print("="*65)
-        print("1. Run Nifty 50 Index Live Analyzer")
-        print("2. Run Daily Stock Screener")
-        print("3. Run 15-Min Live F&O Option Screener")
-        print("4. Run Today's Performance & Movement Tracker (All Assets)")
-        print("5. ALL-IN-ONE (Run Everything Together)")
-        print("6. Exit")
-        print("="*65)
-        
-        choice = input("Enter option number (1-6): ").strip()
+    send_telegram_alert("🔍 <b>F&O Stock Master Screener Started!</b> Scanning sectors...")
+    all_scanned, qualified_matches = scan_fno_universe(auth_token)
 
-        if choice == "1":
-            run_nifty_analyzer(auth_token)
-        elif choice == "2":
-            run_daily_stock_screener(auth_token)
-        elif choice == "3":
-            run_15min_fno_screener(auth_token)
-        elif choice == "4":
-            run_performance_tracker(auth_token)
-        elif choice == "5":
-            run_nifty_analyzer(auth_token)
-            run_daily_stock_screener(auth_token)
-            run_15min_fno_screener(auth_token)
-            run_performance_tracker(auth_token)
-        elif choice == "6":
-            print("\n>>> Exiting Master Engine. Happy Trading!")
-            break
-        else:
-            print("❌ Invalid choice! Select between 1 and 6.")
+    print("\n" + "=" * 95)
+    print("                    RAW METRICS LOG (ALL SCANNED F&O STOCKS)")
+    print("=" * 95)
+    if all_scanned:
+        df_all = pd.DataFrame(all_scanned)
+        print(df_all.to_string(index=False))
+    else:
+        print(">>> No stock data retrieved.")
+    print("=" * 95 + "\n")
+
+    print("=" * 95)
+    print("         🔥 FINAL FILTERED CANDIDATES (RSI >= 60 & ROC > 0 & EMA ALIGNED) 🔥")
+    print("=" * 95)
+    if qualified_matches:
+        df_match = pd.DataFrame(qualified_matches)
+        print(df_match.to_string(index=False))
+        log_scan_results(qualified_matches)
+        send_telegram_alert(f"✅ <b>Scan Complete!</b> Found {len(qualified_matches)} qualified setup(s).")
+    else:
+        print(">>> ZERO STOCKS MATCHED STRICT RSI + ROC + EMA FILTERS TODAY.")
+        send_telegram_alert("ℹ️ <b>Scan Complete!</b> No stocks matched strict RSI+ROC filters today.")
+    print("=" * 95 + "\n")
+
 
 if __name__ == "__main__":
     main()
-    run: |
