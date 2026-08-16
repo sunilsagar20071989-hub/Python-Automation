@@ -11,10 +11,8 @@ from SmartApi import SmartConnect
 # ==========================================
 # 1. SECURE CONFIGURATION & CREDENTIALS
 # ==========================================
-# `.env` file load karein
 load_dotenv()
 
-# Fallback ke saath environment variables read karein
 API_KEY = os.getenv("SMARTAPI_KEY", "N7XNbnkE")
 CLIENT_CODE = os.getenv("SMARTAPI_CLIENT_CODE", "S885143")
 PIN = os.getenv("SMARTAPI_PIN", "1989")
@@ -25,59 +23,51 @@ TELEGRAM_BOT_TOKEN = os.getenv(
 )
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "1427460047")
 
-FNO_OPTION_UNIVERSE = [
-    # BANKING & FINANCIALS
-    {"symbol": "HDFCBANK-EQ", "token": "1333"},
-    {"symbol": "ICICIBANK-EQ", "token": "4963"},
-    {"symbol": "SBIN-EQ", "token": "3045"},
-    {"symbol": "AXISBANK-EQ", "token": "5900"},
-    {"symbol": "KOTAKBANK-EQ", "token": "1922"},
-    {"symbol": "INDUSINDBK-EQ", "token": "5258"},
-    {"symbol": "BANKBARODA-EQ", "token": "4668"},
-    {"symbol": "PNB-EQ", "token": "10666"},
-    {"symbol": "AUBANK-EQ", "token": "21238"},
-    {"symbol": "CANBK-EQ", "token": "10794"},
-    {"symbol": "IDFCFIRSTB-EQ", "token": "11184"},
-    {"symbol": "FEDERALBNK-EQ", "token": "1023"},
-    # IT & TECH
-    {"symbol": "TCS-EQ", "token": "11536"},
-    {"symbol": "INFY-EQ", "token": "1594"},
-    {"symbol": "PERSISTENT-EQ", "token": "18365"},
-    {"symbol": "HCLTECH-EQ", "token": "7229"},
-    {"symbol": "WIPRO-EQ", "token": "3787"},
-    {"symbol": "COFORGE-EQ", "token": "11543"},
-    {"symbol": "TECHM-EQ", "token": "13538"},
-    {"symbol": "LTIM-EQ", "token": "17818"},
-    # AUTO
-    {"symbol": "BAJAJ-AUTO-EQ", "token": "16669"},
-    {"symbol": "M&M-EQ", "token": "2031"},
-    {"symbol": "MARUTI-EQ", "token": "10999"},
-    {"symbol": "TATAMOTORS-EQ", "token": "3456"},
-    {"symbol": "HEROMOTOCO-EQ", "token": "1348"},
-    {"symbol": "TVSMOTOR-EQ", "token": "8479"},
-    {"symbol": "EICHERMOT-EQ", "token": "910"},
-    {"symbol": "BHARATFORG-EQ", "token": "422"},
-    # PHARMA
-    {"symbol": "SUNPHARMA-EQ", "token": "3351"},
-    {"symbol": "CIPLA-EQ", "token": "694"},
-    {"symbol": "DRREDDY-EQ", "token": "881"},
-    {"symbol": "LUPIN-EQ", "token": "10440"},
-    {"symbol": "DIVISLAB-EQ", "token": "10940"},
-    {"symbol": "TORNTPHARM-EQ", "token": "3518"},
-    # METALS & ENERGY
-    {"symbol": "RELIANCE-EQ", "token": "2885"},
-    {"symbol": "TATASTEEL-EQ", "token": "3499"},
-    {"symbol": "HINDALCO-EQ", "token": "1363"},
-    {"symbol": "JINDALSTEL-EQ", "token": "1732"},
-    {"symbol": "VEDL-EQ", "token": "3063"},
-    {"symbol": "NTPC-EQ", "token": "11630"},
-    {"symbol": "POWERGRID-EQ", "token": "14977"},
-    {"symbol": "ONGC-EQ", "token": "2475"},
-]
+
+# ==========================================
+# 2. DYNAMIC F&O UNIVERSE FETCH
+# ==========================================
+def fetch_dynamic_fno_universe():
+  """Angel One Master JSON se saare active F&O underlying NSE Equity stocks dynamic extract karta hai."""
+  print(
+      ">>> Downloading Angel One Master Instrument File for Dynamic F&O"
+      " Universe..."
+  )
+  url = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
+
+  try:
+    resp = requests.get(url, timeout=15)
+    data = resp.json()
+    df_master = pd.DataFrame(data)
+
+    # NFO segment se saare unique underlying trading symbols extract karein
+    nfo_df = df_master[df_master["exch_seg"] == "NFO"]
+    fno_symbols = set(nfo_df["name"].dropna().unique())
+
+    # NSE Equity (EQ) segment mein se unhi F&O symbols ke EQ tokens filter karein
+    nse_eq_df = df_master[
+        (df_master["exch_seg"] == "NSE")
+        & (df_master["symbol"].str.endswith("-EQ"))
+        & (df_master["name"].isin(fno_symbols))
+    ]
+
+    fno_list = []
+    for _, row in nse_eq_df.iterrows():
+      fno_list.append({"symbol": row["symbol"], "token": str(row["token"])})
+
+    print(
+        f">>> Successfully loaded {len(fno_list)} F&O stocks dynamically for"
+        " 15-Min Intraday Scan!\n"
+    )
+    return fno_list
+
+  except Exception as e:
+    print(">>> Dynamic Universe Fetch Error:", e)
+    return []
 
 
 # ==========================================
-# 2. TELEGRAM NOTIFIER FUNCTION
+# 3. TELEGRAM NOTIFIER FUNCTION
 # ==========================================
 def send_telegram_message(message_text):
   if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
@@ -96,7 +86,7 @@ def send_telegram_message(message_text):
 
 
 # ==========================================
-# 3. LOGIN & AUTHENTICATION
+# 4. LOGIN & AUTHENTICATION
 # ==========================================
 def initialize_smartapi():
   try:
@@ -119,7 +109,7 @@ def initialize_smartapi():
       )
       print("\n" + "=" * 95)
       print(
-          ">>> SmartAPI Engine Connected! Real-Time Multi-Day Intraday"
+          ">>> SmartAPI Engine Connected! Dynamic 15-Min Real-Time F&O Scanner"
           " Active..."
       )
       print("=" * 95 + "\n")
@@ -130,7 +120,7 @@ def initialize_smartapi():
 
 
 # ==========================================
-# 4. DATA FETCHING & EVALUATION
+# 5. DATA FETCHING & EVALUATION (15-MIN)
 # ==========================================
 def fetch_live_15min_data(auth_token, token):
   url = "https://apiconnect.angelone.in/rest/secure/angelbroking/historical/v1/getCandleData"
@@ -178,7 +168,6 @@ def fetch_live_15min_data(auth_token, token):
       df["close"] = df["close"].astype(float)
       df["volume"] = df["volume"].astype(float)
 
-      # Extract Date for previous day close mapping
       df["date"] = pd.to_datetime(df["timestamp"]).dt.date
       return df
   except Exception:
@@ -199,7 +188,7 @@ def evaluate_realtime_setup(auth_token, stock):
 
   curr = df.iloc[-1]
 
-  # Correct Previous Day Close Logic
+  # Previous Day Close Mapping
   dates = df["date"].unique()
   if len(dates) >= 2:
     prev_date = dates[-2]
@@ -257,28 +246,37 @@ def evaluate_realtime_setup(auth_token, stock):
 
 
 # ==========================================
-# 5. MAIN PIPELINE
+# 6. MAIN PIPELINE
 # ==========================================
 def main():
   auth_token = initialize_smartapi()
   if not auth_token:
     return
 
-  print(">>> SCANNING REAL-TIME 15-MIN F&O OPTION TRADES...\n")
+  # Step 1: Dynamic F&O Universe Fetch
+  fno_universe = fetch_dynamic_fno_universe()
+  if not fno_universe:
+    print(">>> F&O Universe loading failed. Exiting.")
+    return
+
+  print(
+      f">>> SCANNING {len(fno_universe)} STOCKS FOR 15-MIN REAL-TIME OPTION"
+      " TRADES...\n"
+  )
   all_scanned = []
   matches = []
 
-  for stock in FNO_OPTION_UNIVERSE:
+  for stock in fno_universe:
     status, match = evaluate_realtime_setup(auth_token, stock)
     if status:
       all_scanned.append(status)
     if match:
       matches.append(match)
-    time.sleep(0.06)
+    time.sleep(0.08)  # Smooth API rate limit spacing
 
-  # 1. Terminal Output Print
+  # Terminal Output
   print("\n" + "=" * 95)
-  print("                 LIVE MARKET F&O STOCKS MONITORING TABLE")
+  print("                  LIVE MARKET F&O STOCKS MONITORING TABLE")
   print("=" * 95)
   if all_scanned:
     df_all = pd.DataFrame(all_scanned)
@@ -297,7 +295,7 @@ def main():
     print(">>> No low-risk setups matched live conditions right now.")
   print("=" * 95 + "\n")
 
-  # 2. Telegram Broadcast (Filtered High Conviction Matches Only)
+  # Telegram Broadcast
   if matches:
     df_match = pd.DataFrame(matches)
     match_text = df_match[
@@ -308,5 +306,6 @@ def main():
     )
     send_telegram_message(telegram_msg_match)
 
+
 if __name__ == "__main__":
-     main()
+  main()
