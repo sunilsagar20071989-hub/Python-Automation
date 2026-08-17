@@ -64,5 +64,5 @@ jobs:
         python nifty_algo_paper.py
         python backtest.py
         python fetch_trades.py
-        python telegram_bot.py
+        python telegram_bot.py &
         python intraday_screener.py
