@@ -715,6 +715,35 @@ def get_itm_symbol_and_token(spot_price, option_type):
 
     return None, None
 # ==========================================
+# ==========================================
+# SIGNAL & DATA FETCHING ENGINE (MISSING FUNCTION ADDED)
+# ==========================================
+def fetch_signals_and_data():
+    """
+    Nifty Spot ya Futures ka live price aur technical indicators calculate karke
+    signal return karta hai.
+    """
+    try:
+        # Example: Direct spot token pass karein ya SmartAPI se fetch karein
+        # token = "99926000" # Nifty 50 Index token
+        # spot_ltp = get_live_ltp(token, "NIFTY")
+        
+        # NOTE: Yahan apna technical indicator logic (RSI, EMA, ROC etc.) add karein.
+        # Current implementation placeholder hai:
+        close_price = None  # Example: spot_ltp
+        signal = None       # "CE", "PE", ya None
+
+        # Agar aap live market data fetch kar pa rahe hain:
+        # close_price, signal = calculate_indicators_and_get_signal()
+
+        return close_price, signal
+
+    except Exception as e:
+        print(f"\n[ERROR] fetch_signals_and_data me issue hai: {e}")
+        return None, None
+
+
+# ==========================================
 # REFACTORED MAIN ENGINE EXECUTION LOOP
 # ==========================================
 print(">>> Nifty Auto Bot Active (Auto Entry + Risk Rules + Trailing SL)...")
