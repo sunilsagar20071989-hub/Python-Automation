@@ -3,7 +3,8 @@ name: Automated FNO & Nifty Strategy Pipeline
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 4-10 * * 1-5'
+    # 3:45 AM UTC (9:15 AM IST) से 10:00 AM UTC (3:30 PM IST) तक हर 15 मिनट में चलेगा
+    - cron: '*/15 3-10 * * 1-5'
 
 jobs:
   run-all-strategies:
@@ -64,3 +65,4 @@ jobs:
         python backtest.py
         python fetch_trades.py
         python telegram_bot.py
+        python intraday_screener.py
