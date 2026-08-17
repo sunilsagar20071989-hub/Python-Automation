@@ -23,10 +23,12 @@ TELEGRAM_BOT_TOKEN = os.getenv(
 )
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "1427460047")
 
-# STRATEGY THRESHOLDS (Strict Momentum Criteria)
-MIN_RSI = 60.0  # RSI must be >= 60
-MIN_ROC = 0.0  # ROC must be > 0
-ENABLE_EMA_FILTER = True  # Enforce EMA 9 > EMA 21 & Close > EMA 44
+# STRATEGY THRESHOLDS (Strict Momentum & Breakout Criteria)
+MIN_RSI = 65.0  # Raised to 65 for stronger momentum
+MIN_ROC = 1.5  # ROC must be >= 1.5%
+MIN_VOL_SURGE_RATIO = 1.5  # Volume must be >= 1.5x of 20-day SMA Volume
+MIN_DAY_CHANGE_PCT = 2.0  # Minimum 2% intraday price surge
+ENABLE_EMA_FILTER = True  # EMA 9 > EMA 21 & Close > EMA 44
 
 
 # ==========================================
@@ -108,7 +110,8 @@ def initialize_smartapi():
       )
       print("\n" + "=" * 85)
       print(
-          ">>> SmartAPI Authenticated! Strict Indicator Verification Active..."
+          ">>> SmartAPI Authenticated! Strict Breakout & Momentum Verification"
+          " Active..."
       )
       print("=" * 85 + "\n")
       return auth_token
@@ -162,6 +165,8 @@ def fetch_candle_data_direct(auth_token, token, interval, days, exchange="NSE"):
           columns=["timestamp", "open", "high", "low", "close", "volume"],
       )
       df["close"] = df["close"].astype(float)
+      df["high"] = df["high"].astype(float)
+      df["low"] = df["low"].astype(float)
       df["volume"] = df["volume"].astype(float)
       return df
   except Exception:
@@ -170,12 +175,13 @@ def fetch_candle_data_direct(auth_token, token, interval, days, exchange="NSE"):
 
 
 # ==========================================
-# 6. DYNAMIC F&O STOCK SCANNER
+# 6. DYNAMIC F&O STOCK SCANNER (STRICT HIGH-CONVICTION FILTERS)
 # ==========================================
 def scan_fno_universe(auth_token, fno_stock_list):
   print(
-      f">>> SCANNING {len(fno_stock_list)} F&O STOCKS WITH STRICT FILTERS (RSI"
-      f" >= {MIN_RSI}, ROC > {MIN_ROC}, EMA Alignment)...\n"
+      f">>> SCANNING {len(fno_stock_list)} F&O STOCKS WITH STRICT BREAKOUT"
+      f" FILTERS (RSI >= {MIN_RSI}, Vol >= {MIN_VOL_SURGE_RATIO}x, 20-Day High"
+      " Breakout)...\n"
   )
   all_scanned = []
   qualified_matches = []
@@ -197,33 +203,55 @@ def scan_fno_universe(auth_token, fno_stock_list):
     df_daily["vol_sma20"] = df_daily["volume"].rolling(window=20).mean()
 
     curr = df_daily.iloc[-1]
+    prev_close = df_daily.iloc[-2]["close"]
 
-    # Individual Conditions Check
+    # 1. Volume Surge Check (Volume >= 1.5x 20-day Volume Average)
+    vol_ratio = (
+        curr["volume"] / curr["vol_sma20"] if curr["vol_sma20"] > 0 else 0
+    )
+    vol_pass = vol_ratio >= MIN_VOL_SURGE_RATIO
+
+    # 2. Price Breakout Check (Closing higher than last 20-day highest candle)
+    recent_20_high = df_daily["high"].iloc[-21:-1].max()
+    breakout_pass = curr["close"] >= recent_20_high
+
+    # 3. Minimum Intraday Move % (At least 2% gain today)
+    day_change_pct = ((curr["close"] - prev_close) / prev_close) * 100
+    move_pass = day_change_pct >= MIN_DAY_CHANGE_PCT
+
+    # 4. Strict Indicators Filter
     rsi_pass = curr["rsi"] >= MIN_RSI
-    roc_pass = curr["roc"] > MIN_ROC
+    roc_pass = curr["roc"] >= MIN_ROC
     ema_pass = (
         (curr["ema_9"] > curr["ema_21"]) and (curr["close"] > curr["ema_44"])
         if ENABLE_EMA_FILTER
         else True
     )
-    vol_pass = curr["volume"] > curr["vol_sma20"]
 
     status_data = {
         "Symbol": symbol,
         "LTP": round(curr["close"], 2),
+        "Change%": round(day_change_pct, 2),
         "RSI(14)": round(curr["rsi"], 2),
         "ROC(12)": round(curr["roc"], 2),
-        "RSI_>=_60": "PASS" if rsi_pass else "FAIL",
-        "ROC_>_0": "PASS" if roc_pass else "FAIL",
-        "EMA_Trend": "PASS" if ema_pass else "FAIL",
-        "VolSurge": "YES" if vol_pass else "NO",
+        "VolRatio": round(vol_ratio, 2),
+        "RSI_Pass": "PASS" if rsi_pass else "FAIL",
+        "Vol_Pass": "PASS" if vol_pass else "FAIL",
+        "Breakout": "YES" if breakout_pass else "NO",
     }
     all_scanned.append(status_data)
 
     # STRICT ENFORCEMENT: ALL FILTERS MUST PASS
-    if rsi_pass and roc_pass and ema_pass:
+    if (
+        rsi_pass
+        and roc_pass
+        and ema_pass
+        and vol_pass
+        and breakout_pass
+        and move_pass
+    ):
       match_data = status_data.copy()
-      match_data["Signal"] = "🚀 STRICT MOMENTUM BUY"
+      match_data["Signal"] = "🚀 HIGH CONVICTION BREAKOUT"
       qualified_matches.append(match_data)
 
     time.sleep(0.12)  # API Rate limit safety
@@ -266,8 +294,8 @@ def main():
 
   print("=" * 95)
   print(
-      "         🔥 FINAL FILTERED CANDIDATES (RSI >= 60 & ROC > 0 & EMA"
-      " ALIGNED) 🔥"
+      "  🔥 FINAL FILTERED CANDIDATES (RSI >= 65, Vol >= 1.5x, 20-Day High"
+      " Breakout) 🔥"
   )
   print("=" * 95)
   if qualified_matches:
@@ -276,12 +304,18 @@ def main():
 
     # Send Filtered Alert to Telegram
     formatted_str = df_match[
-        ["Symbol", "LTP", "RSI(14)", "ROC(12)", "VolSurge"]
+        ["Symbol", "LTP", "Change%", "RSI(14)", "VolRatio"]
     ].to_string(index=False)
-    msg = f"<b>🚀 MOMENTUM SCANNER CANDIDATES</b>\n<pre>{formatted_str}</pre>"
+    msg = (
+        "<b>🚀 HIGH CONVICTION BREAKOUT CANDIDATES</b>\n<pre>"
+        f"{formatted_str}</pre>"
+    )
     send_telegram_message(msg)
   else:
-    print(">>> ZERO STOCKS MATCHED STRICT RSI + ROC + EMA FILTERS TODAY.")
+    print(
+        ">>> ZERO STOCKS MATCHED STRICT RSI + VOL SURGE + BREAKOUT FILTERS"
+        " TODAY."
+    )
   print("=" * 95 + "\n")
 
 
