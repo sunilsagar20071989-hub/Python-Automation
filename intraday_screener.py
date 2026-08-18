@@ -1,8 +1,9 @@
 # ==============================================================================
-# DYNAMIC F&O STOCKS MASTER SCREENER & TELEGRAM ALERT BOT (STRICT BREAKOUT VERSION)
+# MULTI-TIMEFRAME (DAILY + WEEKLY) LIVE INTRADAY SCREENER & TELEGRAM BOT
 # ==============================================================================
 
-from datetime import datetime, timedelta
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, time as dtime, timedelta
 import logging
 import os
 import time
@@ -19,53 +20,93 @@ logging.basicConfig(
 )
 logger = logging.getLogger("StockScreener")
 
-# ==========================================
-# 1. CONFIGURATION & SECURE ENVIRONMENT VARIABLES
-# ==========================================
+# SECURE CONFIGURATION READ
 load_dotenv()
 
-API_KEY = os.getenv("SMARTAPI_KEY", "N7XNbnkE")
-CLIENT_CODE = os.getenv("SMARTAPI_CLIENT_CODE", "S885143")
-PIN = os.getenv("SMARTAPI_PIN", "1989")
-TOTP_SECRET = os.getenv("SMARTAPI_TOTP_SECRET", "ZH76UOCDHM4TITQGDKN32HBZEI")
+API_KEY = os.getenv("SMARTAPI_KEY")
+CLIENT_CODE = os.getenv("SMARTAPI_CLIENT_CODE")
+PIN = os.getenv("SMARTAPI_PIN")
+TOTP_SECRET = os.getenv("SMARTAPI_TOTP_SECRET")
 
-TELEGRAM_BOT_TOKEN = os.getenv(
-    "TELEGRAM_BOT_TOKEN", "8560792327:AAErjHTU4LlKxlueD4c-EXxS2KcqVwBrDN8"
-)
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "1427460047")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-# STRATEGY THRESHOLDS (Strict Breakout & Momentum Criteria)
-MIN_RSI = 65.0  # RSI must be >= 65 for strong momentum
-MIN_ROC = 1.5  # ROC must be >= 1.5%
-MIN_VOL_SURGE_RATIO = 1.5  # Volume must be >= 1.5x of 20-day SMA
-MIN_DAY_CHANGE_PCT = 2.0  # Minimum 2% intraday price surge
-ENABLE_EMA_FILTER = True  # Enforce EMA 9 > EMA 21 & Close > EMA 44
+# MULTI-TIMEFRAME MOMENTUM PARAMETERS
+MIN_DAILY_RSI = 60.0
+MIN_DAILY_ROC = 1.0
+REQUIRE_VOL_SURGE = True
+MIN_WEEKLY_RSI = 55.0
+ENABLE_200_EMA_FILTER = True  # Strict institutional trend filter
 
-# RISK PARAMETERS
-SL_PCT = 0.045  # 4.5% Initial Stop Loss
-TARGET_PCT = 0.1575  # 15.75% Target Gain
-MAX_RISK_PER_TRADE_PCT = 0.015  # Max 1.5% account capital risk per stock
+# LIVE MONITORING CONFIG
+SCAN_INTERVAL_MINUTES = 15
+MAX_WORKERS = 3  # Reduced workers to comply with Angel One API Rate Limits (3 req/sec)
+MASTER_FILE_LOCAL = "OpenAPIScripMaster.json"
 
 LOG_FILE = "fno_scan_log.csv"
 smart_api_instance = None
+http_session = requests.Session()
+alerted_stocks_today = set()
+last_alert_reset_date = datetime.now().date()
 
 
-# ==========================================
-# 2. DYNAMIC F&O UNIVERSE FETCH
-# ==========================================
+def send_telegram_alert(message):
+  if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+    return
+  url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+  payload = {
+      "chat_id": TELEGRAM_CHAT_ID,
+      "text": message,
+      "parse_mode": "HTML",
+  }
+  try:
+    http_session.post(url, data=payload, timeout=5)
+  except Exception as e:
+    logger.error(f"Telegram Alert Exception: {e}")
+
+
+def initialize_smartapi():
+  global smart_api_instance
+  try:
+    if not all([API_KEY, CLIENT_CODE, PIN, TOTP_SECRET]):
+      logger.error("Missing SmartAPI environment variables.")
+      return None
+    smart_api_instance = SmartConnect(api_key=API_KEY)
+    totp_code = pyotp.TOTP(TOTP_SECRET).now()
+    data = smart_api_instance.generateSession(CLIENT_CODE, PIN, totp_code)
+    if data and data.get("status"):
+      raw_token = data["data"]["jwtToken"]
+      auth_token = (
+          raw_token
+          if raw_token.startswith("Bearer ")
+          else f"Bearer {raw_token}"
+      )
+      return auth_token
+  except Exception as e:
+    logger.error(f"Auth Exception: {e}")
+  return None
+
+
 def fetch_dynamic_fno_universe():
-  """Angel One Master JSON se saare active F&O underlying NSE Equity stocks dynamic extract karta hai."""
-  logger.info(
-      ">>> Downloading Angel One Master Instrument File for Dynamic F&O"
-      " Universe..."
-  )
   url = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
+  download_needed = True
+
+  if os.path.exists(MASTER_FILE_LOCAL):
+    file_time = datetime.fromtimestamp(os.path.getmtime(MASTER_FILE_LOCAL))
+    if file_time.date() == datetime.now().date():
+      download_needed = False
+
+  if download_needed:
+    try:
+      resp = http_session.get(url, timeout=30)
+      with open(MASTER_FILE_LOCAL, "wb") as f:
+        f.write(resp.content)
+    except Exception:
+      if not os.path.exists(MASTER_FILE_LOCAL):
+        return []
 
   try:
-    resp = requests.get(url, timeout=15)
-    data = resp.json()
-    df_master = pd.DataFrame(data)
-
+    df_master = pd.read_json(MASTER_FILE_LOCAL)
     nfo_df = df_master[df_master["exch_seg"] == "NFO"]
     fno_symbols = set(nfo_df["name"].dropna().unique())
 
@@ -75,97 +116,16 @@ def fetch_dynamic_fno_universe():
         & (df_master["name"].isin(fno_symbols))
     ]
 
-    fno_list = []
-    for _, row in nse_eq_df.iterrows():
-      fno_list.append({"symbol": row["symbol"], "token": str(row["token"])})
-
-    logger.info(
-        f">>> Successfully loaded {len(fno_list)} F&O stocks dynamically for"
-        " Daily Scan!\n"
-    )
-    return fno_list
-
-  except Exception as e:
-    logger.error(f"Dynamic Universe Fetch Error: {e}")
+    return [
+        {"symbol": row["symbol"], "token": str(row["token"])}
+        for _, row in nse_eq_df.iterrows()
+    ]
+  except Exception:
     return []
 
 
-# ==========================================
-# 3. TELEGRAM NOTIFICATION ENGINE
-# ==========================================
-def send_telegram_alert(message):
-  """Sends HTML formatted Telegram notifications"""
-  if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-    logger.warning("Telegram Bot Token ya Chat ID missing hai.")
-    return
-
-  url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-  payload = {
-      "chat_id": TELEGRAM_CHAT_ID,
-      "text": message,
-      "parse_mode": "HTML",
-  }
-  try:
-    requests.post(url, data=payload, timeout=10)
-  except Exception as e:
-    logger.error(f"Telegram Alert Exception: {e}")
-
-
-# ==========================================
-# 4. LOGIN & AUTHENTICATION
-# ==========================================
-def initialize_smartapi():
-  global smart_api_instance
-  try:
-    if not all([API_KEY, CLIENT_CODE, PIN, TOTP_SECRET]):
-      logger.error("SmartAPI Credentials missing hain!")
-      return None
-
-    smart_api_instance = SmartConnect(api_key=API_KEY)
-    totp_code = pyotp.TOTP(TOTP_SECRET).now()
-    data = smart_api_instance.generateSession(CLIENT_CODE, PIN, totp_code)
-
-    if data and data.get("status"):
-      raw_token = data["data"]["jwtToken"]
-      auth_token = (
-          raw_token
-          if raw_token.startswith("Bearer ")
-          else f"Bearer {raw_token}"
-      )
-      logger.info(">>> SmartAPI Authenticated Successfully!")
-      return auth_token
-  except Exception as e:
-    logger.error(f"Authentication Exception: {e}")
-  return None
-
-
-# ==========================================
-# 5. DYNAMIC POSITION SIZING (RMS INTEGRATION)
-# ==========================================
-def calculate_dynamic_position_size(entry_price):
-  """Calculates quantity based on account capital risk"""
-  try:
-    if smart_api_instance:
-      rms_data = smart_api_instance.rmsLimit()
-      if rms_data and rms_data.get("status") and "data" in rms_data:
-        net_capital = float(rms_data["data"].get("net", 0.0))
-        if net_capital > 0:
-          max_risk_amount = net_capital * MAX_RISK_PER_TRADE_PCT
-          risk_per_share = entry_price * SL_PCT
-          quantity = int(max_risk_amount // risk_per_share)
-          return max(1, quantity), net_capital
-  except Exception as e:
-    logger.error(f"Error Fetching RMS Data: {e}")
-
-  return 10, 0.0
-
-
-# ==========================================
-# 6. HISTORICAL DATA FETCH
-# ==========================================
-def fetch_candle_data_direct(auth_token, token, interval, days, exchange="NSE"):
+def fetch_candle_data_direct(auth_token, token, interval, days):
   url = "https://apiconnect.angelone.in/rest/secure/angelbroking/historical/v1/getCandleData"
-
   headers = {
       "Content-Type": "application/json",
       "Accept": "application/json",
@@ -179,12 +139,11 @@ def fetch_candle_data_direct(auth_token, token, interval, days, exchange="NSE"):
   }
 
   now = datetime.now()
-  last_trade_date = now - timedelta(days=1) if now.hour < 9 else now
-  to_date = last_trade_date.strftime("%Y-%m-%d 15:30")
-  from_date = (last_trade_date - timedelta(days=days)).strftime("%Y-%m-%d 09:15")
+  to_date = now.strftime("%Y-%m-%d %H:%M")
+  from_date = (now - timedelta(days=days)).strftime("%Y-%m-%d 09:15")
 
   payload = {
-      "exchange": exchange,
+      "exchange": "NSE",
       "symboltoken": str(token),
       "interval": interval,
       "fromdate": from_date,
@@ -192,17 +151,14 @@ def fetch_candle_data_direct(auth_token, token, interval, days, exchange="NSE"):
   }
 
   try:
-    resp = requests.post(url, headers=headers, json=payload, timeout=8)
+    resp = http_session.post(url, headers=headers, json=payload, timeout=5)
     resp_json = resp.json()
-
     if resp_json.get("status") and resp_json.get("data"):
       df = pd.DataFrame(
           resp_json["data"],
           columns=["timestamp", "open", "high", "low", "close", "volume"],
       )
       df["close"] = df["close"].astype(float)
-      df["high"] = df["high"].astype(float)
-      df["low"] = df["low"].astype(float)
       df["volume"] = df["volume"].astype(float)
       return df
   except Exception:
@@ -210,178 +166,158 @@ def fetch_candle_data_direct(auth_token, token, interval, days, exchange="NSE"):
   return None
 
 
-# ==========================================
-# 7. STOCK SCANNER ENGINE & TELEGRAM ALERTS
-# ==========================================
-def scan_fno_universe(auth_token, fno_universe):
-  logger.info(
-      f">>> Scanning {len(fno_universe)} F&O Stocks with Strict Breakout"
-      " Filters..."
+def analyze_stock_multi_tf(stock, auth_token):
+  global alerted_stocks_today, last_alert_reset_date
+
+  # Reset daily tracking set at midnight
+  if datetime.now().date() != last_alert_reset_date:
+    alerted_stocks_today.clear()
+    last_alert_reset_date = datetime.now().date()
+
+  symbol = stock["symbol"]
+  token = stock["token"]
+
+  # Rate Limiter Sleep (Ensures compliance with Angel API rate limit)
+  time.sleep(0.35)
+
+  # 1. Fetch Daily Data (Minimum 300 days for 200 EMA accuracy)
+  df_daily = fetch_candle_data_direct(
+      auth_token, token, "ONE_DAY", days=350
   )
-  all_scanned = []
-  qualified_matches = []
+  if df_daily is None or len(df_daily) < 200:
+    return None, None
 
-  for stock in fno_universe:
-    symbol = stock["symbol"]
-    token = stock["token"]
+  df_daily["rsi"] = ta.momentum.rsi(df_daily["close"], window=14)
+  df_daily["roc"] = ta.momentum.roc(df_daily["close"], window=12)
+  df_daily["ema_9"] = ta.trend.ema_indicator(df_daily["close"], window=9)
+  df_daily["ema_21"] = ta.trend.ema_indicator(df_daily["close"], window=21)
+  df_daily["ema_200"] = ta.trend.ema_indicator(df_daily["close"], window=200)
+  df_daily["vol_sma20"] = df_daily["volume"].rolling(window=20).mean()
 
-    df_daily = fetch_candle_data_direct(auth_token, token, "ONE_DAY", days=100)
-    if df_daily is None or len(df_daily) < 45:
-      continue
+  curr_d = df_daily.iloc[-1]
+  entry_p = round(curr_d["close"], 2)
 
-    # Technical Indicators
-    df_daily["rsi"] = ta.momentum.rsi(df_daily["close"], window=14)
-    df_daily["roc"] = ta.momentum.roc(df_daily["close"], window=12)
-    df_daily["ema_9"] = ta.trend.ema_indicator(df_daily["close"], window=9)
-    df_daily["ema_21"] = ta.trend.ema_indicator(df_daily["close"], window=21)
-    df_daily["ema_44"] = ta.trend.ema_indicator(df_daily["close"], window=44)
-    df_daily["vol_sma20"] = df_daily["volume"].rolling(window=20).mean()
+  daily_rsi_pass = curr_d["rsi"] >= MIN_DAILY_RSI
+  daily_roc_pass = curr_d["roc"] >= MIN_DAILY_ROC
+  daily_ema_pass = curr_d["ema_9"] > curr_d["ema_21"]
+  ema_200_pass = (
+      curr_d["close"] > curr_d["ema_200"] if ENABLE_200_EMA_FILTER else True
+  )
+  vol_pass = (
+      curr_d["volume"] >= curr_d["vol_sma20"] if REQUIRE_VOL_SURGE else True
+  )
 
-    curr = df_daily.iloc[-1]
-    prev_close = df_daily.iloc[-2]["close"]
-    entry_p = round(curr["close"], 2)
+  # Initial fast filter check
+  if not (
+      daily_rsi_pass
+      and daily_roc_pass
+      and daily_ema_pass
+      and ema_200_pass
+      and vol_pass
+  ):
+    return None, None
 
-    # 1. Volume Surge Check (Volume >= 1.5x 20-day Volume Average)
-    vol_ratio = (
-        curr["volume"] / curr["vol_sma20"] if curr["vol_sma20"] > 0 else 0
+  # 2. Fetch Native Weekly Setup (Avoids manual resampling bias)
+  df_weekly = fetch_candle_data_direct(
+      auth_token, token, "ONE_WEEK", days=300
+  )
+  if df_weekly is None or len(df_weekly) < 20:
+    return None, None
+
+  df_weekly["w_rsi"] = ta.momentum.rsi(df_weekly["close"], window=14)
+  df_weekly["w_ema21"] = ta.trend.ema_indicator(
+      df_weekly["close"], window=21
+  )
+
+  curr_w = df_weekly.iloc[-1]
+  weekly_pass = (curr_w["w_rsi"] >= MIN_WEEKLY_RSI) and (
+      curr_w["close"] > curr_w["w_ema21"]
+  )
+
+  if not weekly_pass:
+    return None, None
+
+  # Both Daily & Weekly Aligned
+  match_data = {
+      "Symbol": symbol,
+      "LTP": entry_p,
+      "Daily_RSI": round(curr_d["rsi"], 2),
+      "Weekly_RSI": round(curr_w["w_rsi"], 2),
+      "Daily_ROC": round(curr_d["roc"], 2),
+      "Signal": "🚀 DUAL-TF MOMENTUM BUY",
+  }
+
+  if symbol not in alerted_stocks_today:
+    alerted_stocks_today.add(symbol)
+    tg_msg = (
+        f"⚡ <b>LIVE BREAKOUT DETECTED (DAILY + WEEKLY)</b>\n\n"
+        f"<b>Stock:</b> {symbol}\n"
+        f"<b>LTP:</b> ₹{entry_p}\n"
+        f"<b>Daily RSI:</b> {round(curr_d['rsi'], 2)}\n"
+        f"<b>Weekly RSI:</b> {round(curr_w['w_rsi'], 2)}\n"
+        f"<b>Daily ROC:</b> {round(curr_d['roc'], 2)}%\n"
+        f"<b>Above 200 EMA:</b> YES (₹{round(curr_d['ema_200'], 2)})\n"
+        f"<b>Status:</b> High-Probability Setup Active 🔥"
     )
-    vol_pass = vol_ratio >= MIN_VOL_SURGE_RATIO
+    send_telegram_alert(tg_msg)
 
-    # 2. Price Breakout Check (20-day High Breakout)
-    recent_20_high = df_daily["high"].iloc[-21:-1].max()
-    breakout_pass = curr["close"] >= recent_20_high
-
-    # 3. Minimum Intraday Move % (At least 2% gain today)
-    day_change_pct = ((curr["close"] - prev_close) / prev_close) * 100
-    move_pass = day_change_pct >= MIN_DAY_CHANGE_PCT
-
-    # 4. Strict Indicators Check
-    rsi_pass = curr["rsi"] >= MIN_RSI
-    roc_pass = curr["roc"] >= MIN_ROC
-    ema_pass = (
-        (curr["ema_9"] > curr["ema_21"]) and (curr["close"] > curr["ema_44"])
-        if ENABLE_EMA_FILTER
-        else True
-    )
-
-    status_data = {
-        "Symbol": symbol,
-        "LTP": entry_p,
-        "Change%": round(day_change_pct, 2),
-        "RSI(14)": round(curr["rsi"], 2),
-        "ROC(12)": round(curr["roc"], 2),
-        "VolRatio": round(vol_ratio, 2),
-        "RSI_Pass": "PASS" if rsi_pass else "FAIL",
-        "Vol_Pass": "PASS" if vol_pass else "FAIL",
-        "Breakout": "YES" if breakout_pass else "NO",
-    }
-    all_scanned.append(status_data)
-
-    # STRICT ENFORCEMENT: ALL FILTERS MUST PASS TOGETHER
-    if (
-        rsi_pass
-        and roc_pass
-        and ema_pass
-        and vol_pass
-        and breakout_pass
-        and move_pass
-    ):
-      qty, capital = calculate_dynamic_position_size(entry_p)
-      initial_sl = round(entry_p * (1 - SL_PCT), 2)
-      tgt_p = round(entry_p * (1 + TARGET_PCT), 2)
-
-      match_data = status_data.copy()
-      match_data["Signal"] = "🚀 HIGH CONVICTION BUY"
-      match_data["Alloc_Qty"] = qty
-      match_data["Initial_SL"] = initial_sl
-      match_data["Target"] = tgt_p
-      qualified_matches.append(match_data)
-
-      # Send Telegram Notification for Pure Breakouts
-      tg_msg = (
-          f"🚀 <b>HIGH CONVICTION BREAKOUT SIGNAL</b>\n\n"
-          f"<b>Stock:</b> {symbol}\n"
-          f"<b>LTP:</b> ₹{entry_p} ({round(day_change_pct, 2)}%)\n"
-          f"<b>RSI(14):</b> {round(curr['rsi'], 2)}\n"
-          f"<b>ROC(12):</b> {round(curr['roc'], 2)}%\n"
-          f"<b>Volume Surge:</b> {round(vol_ratio, 2)}x ⚡\n"
-          f"<b>20-Day High Breakout:</b> YES 🎯\n\n"
-          f"<b>Suggested Qty:</b> {qty}\n"
-          f"<b>Stop Loss (4.5%):</b> ₹{initial_sl}\n"
-          f"<b>Target (15.75%):</b> ₹{tgt_p}"
-      )
-      send_telegram_alert(tg_msg)
-
-    time.sleep(0.08)
-
-  return all_scanned, qualified_matches
+  return match_data, match_data
 
 
-def log_scan_results(qualified_matches):
-  """Exports scanned results into CSV file"""
-  if qualified_matches:
-    df_log = pd.DataFrame(qualified_matches)
-    df_log["Scan_Timestamp"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    file_exists = os.path.isfile(LOG_FILE)
-    df_log.to_csv(LOG_FILE, mode="a", header=not file_exists, index=False)
-    logger.info(f"Saved {len(qualified_matches)} setup(s) to {LOG_FILE}")
-
-
-# ==========================================
-# 8. MAIN PIPELINE
-# ==========================================
-def main():
+def run_live_scanner():
   auth_token = initialize_smartapi()
   if not auth_token:
-    logger.error("Session initialization failed. Exiting.")
+    logger.error("SmartAPI login failed.")
     return
 
-  # Step 1: Load Dynamic Universe
   fno_universe = fetch_dynamic_fno_universe()
   if not fno_universe:
-    logger.error("F&O Universe loading failed. Exiting.")
     return
 
-  send_telegram_alert(
-      "🔍 <b>Strict Breakout Screener Started!</b> Scanning"
-      f" {len(fno_universe)} stocks..."
+  logger.info(
+      f"[{datetime.now().strftime('%H:%M:%S')}] Scanning {len(fno_universe)}"
+      " F&O stocks..."
   )
 
-  # Step 2: Scan Stocks
-  all_scanned, qualified_matches = scan_fno_universe(auth_token, fno_universe)
+  qualified_matches = []
+  with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+    futures = [
+        executor.submit(analyze_stock_multi_tf, stock, auth_token)
+        for stock in fno_universe
+    ]
+    for future in as_completed(futures):
+      _, match_data = future.result()
+      if match_data:
+        qualified_matches.append(match_data)
 
-  print("\n" + "=" * 95)
-  print("                    RAW METRICS LOG (ALL SCANNED F&O STOCKS)")
-  print("=" * 95)
-  if all_scanned:
-    df_all = pd.DataFrame(all_scanned)
-    print(df_all.to_string(index=False))
-  else:
-    print(">>> No stock data retrieved.")
-  print("=" * 95 + "\n")
-
-  print("=" * 95)
-  print(
-      "  🔥 FINAL FILTERED CANDIDATES (RSI >= 65, VOL >= 1.5x, 20-DAY HIGH"
-      " BREAKOUT) 🔥"
-  )
-  print("=" * 95)
   if qualified_matches:
     df_match = pd.DataFrame(qualified_matches)
+    print("\n" + "=" * 80)
+    print("                🔥 ACTIVE DUAL-TIMEFRAME MATCHES 🔥")
+    print("=" * 80)
     print(df_match.to_string(index=False))
-    log_scan_results(qualified_matches)
-    send_telegram_alert(
-        f"✅ <b>Scan Complete!</b> Found {len(qualified_matches)} high-conviction"
-        " breakout setup(s)."
-    )
-  else:
-    print(">>> ZERO STOCKS MATCHED STRICT BREAKOUT FILTERS TODAY.")
-    send_telegram_alert(
-        "ℹ️ <b>Scan Complete!</b> No stocks matched strict breakout filters"
-        " today."
-    )
-  print("=" * 95 + "\n")
+    print("=" * 80 + "\n")
 
 
+# MAIN AUTO-SCHEDULER LOOP
 if __name__ == "__main__":
-  main()
+  send_telegram_alert(
+      "🤖 <b>Dual-Timeframe Screener Bot Online!</b> Listening for live"
+      " breakouts..."
+  )
+
+  while True:
+    now = datetime.now()
+    if now.weekday() < 5 and (
+        (now.hour == 9 and now.minute >= 15)
+        or (10 <= now.hour < 15)
+        or (now.hour == 15 and now.minute <= 30)
+    ):
+      run_live_scanner()
+      logger.info(
+          f"Sleeping for {SCAN_INTERVAL_MINUTES} minutes until next cycle..."
+      )
+      time.sleep(SCAN_INTERVAL_MINUTES * 60)
+    else:
+      logger.info("Market is Closed. Waiting for market hours...")
+      time.sleep(300)
