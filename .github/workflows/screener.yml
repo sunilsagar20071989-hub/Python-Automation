@@ -27,7 +27,7 @@ jobs:
 
       - name: Execute Live Intraday & F&O Screeners
         env:
-          SMARTAPI_KEY: ${{ secrets.SMARTAPI_KEY }}
+          SMARTAPI_API_KEY: ${{ secrets.SMARTAPI_KEY }}
           SMARTAPI_CLIENT_CODE: ${{ secrets.SMARTAPI_CLIENT_CODE }}
           SMARTAPI_PIN: ${{ secrets.SMARTAPI_PIN }}
           SMARTAPI_TOTP_SECRET: ${{ secrets.SMARTAPI_TOTP_SECRET }}
