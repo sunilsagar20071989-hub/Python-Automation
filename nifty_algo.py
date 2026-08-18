@@ -30,10 +30,15 @@ logger = logging.getLogger("NiftyAlgo")
 # ==========================================
 # 1. SECURE CREDENTIALS & RISK PARAMETERS
 # ==========================================
-API_KEY = os.getenv("SMARTAPI_KEY")
-CLIENT_CODE = os.getenv("SMARTAPI_CLIENT_CODE")
-PIN = os.getenv("SMARTAPI_PIN")
-TOTP_SECRET = os.getenv("SMARTAPI_TOTP_SECRET")
+API_KEY = os.getenv("SMARTAPI_API_KEY") or os.getenv("SMARTAPI_KEY") or os.getenv("API_KEY")
+CLIENT_CODE = os.getenv("SMARTAPI_CLIENT_CODE") or os.getenv("CLIENT_CODE") or os.getenv("CLIENT_ID")
+PIN = os.getenv("SMARTAPI_PIN") or os.getenv("PIN")
+TOTP_SECRET = os.getenv("SMARTAPI_TOTP_SECRET") or os.getenv("TOTP_SECRET")
+
+if not API_KEY: missing_vars.append("SMARTAPI_API_KEY")
+if not CLIENT_CODE: missing_vars.append("SMARTAPI_CLIENT_CODE")
+if not PIN: missing_vars.append("SMARTAPI_PIN")
+if not TOTP_SECRET: missing_vars.append("SMARTAPI_TOTP_SECRET")
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
