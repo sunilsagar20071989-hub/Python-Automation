@@ -11,7 +11,6 @@ import pyotp
 import requests
 import ta
 from SmartApi import SmartConnect
-from SmartApi.smartWebSocketV2 import SmartWebSocketV2
 
 # Logging Configuration
 logging.basicConfig(
@@ -50,8 +49,6 @@ NIFTY_TOKEN = "99926000"
 
 MAX_DAILY_TRADES = 4
 MAX_HOLDING_MINUTES = 22
-daily_trades_count = 0
-trade_entry_time = None
 
 pos_active = False
 active_symbol = ""
@@ -63,16 +60,10 @@ highest_price_seen = 0.0
 tsl_activated = False
 active_quantity = NIFTY_LOT_SIZE
 
-# Bot State Controls
-algo_paused = False
-telegram_last_update_id = 0
-
 scrip_master_df = None
 auth_token = ""
 feed_token = ""
 
-live_ltp_dict = {}
-sws = None
 smartApi = None
 LOG_FILE = "trade_log.csv"
 
@@ -139,16 +130,9 @@ def send_telegram_alert(message, max_retries=3):
 
 def log_trade(symbol, trade_type, entry_p, exit_p, qty, reason):
     """Logs trade performance metrics into CSV file"""
-    global trade_entry_time
-
     pnl = round((exit_p - entry_p) * qty, 2)
     pnl_pct = (
         round(((exit_p - entry_p) / entry_p) * 100, 2) if entry_p > 0 else 0.0
-    )
-    holding_time = (
-        round((datetime.now() - trade_entry_time).total_seconds() / 60.0, 2)
-        if trade_entry_time
-        else 0.0
     )
 
     log_data = {
@@ -160,7 +144,6 @@ def log_trade(symbol, trade_type, entry_p, exit_p, qty, reason):
         "Quantity": qty,
         "PnL_INR": pnl,
         "PnL_PCT": pnl_pct,
-        "Holding_Mins": holding_time,
         "Exit_Reason": reason,
     }
 
@@ -168,173 +151,6 @@ def log_trade(symbol, trade_type, entry_p, exit_p, qty, reason):
     file_exists = os.path.isfile(LOG_FILE)
     df_log.to_csv(LOG_FILE, mode="a", header=not file_exists, index=False)
     logger.info(f"[TRADE LOGGED] PnL: ₹{pnl} ({pnl_pct}%) | Exit: {reason}")
-
-
-def process_telegram_command(command):
-    """Handles interactive control commands via Telegram"""
-    global pos_active, active_symbol, active_token, active_quantity, entry_price
-    global sl_price, tgt_price, highest_price_seen, tsl_activated, trade_entry_time
-    global daily_trades_count, algo_paused
-
-    cmd = command.strip().split()[0].split("@")[0].lower()
-
-    if cmd == "/status":
-        if pos_active:
-            ltp = get_live_ltp(active_token, active_symbol) or entry_price
-            pnl = round((ltp - entry_price) * active_quantity, 2)
-            pnl_pct = round(((ltp - entry_price) / entry_price) * 100, 2)
-            holding_time = (
-                round(
-                    (datetime.now() - trade_entry_time).total_seconds() / 60.0,
-                    1,
-                )
-                if trade_entry_time
-                else 0
-            )
-
-            msg = (
-                f"📊 <b>CURRENT POSITION STATUS</b>\n"
-                f"<b>Symbol:</b> {active_symbol}\n"
-                f"<b>Quantity:</b> {active_quantity}\n"
-                f"<b>Entry Price:</b> ₹{entry_price:.2f}\n"
-                f"<b>LTP:</b> ₹{ltp:.2f}\n"
-                f"<b>Stop Loss:</b> ₹{sl_price:.2f}\n"
-                f"<b>Target:</b> ₹{tgt_price:.2f}\n"
-                f"<b>PnL:</b> ₹{pnl} ({pnl_pct}%)\n"
-                f"<b>Holding Time:</b> {holding_time}m / {MAX_HOLDING_MINUTES}m\n"
-                f"<b>Bot Status:</b> {'PAUSED' if algo_paused else 'RUNNING'}"
-            )
-        else:
-            spot = get_nifty_spot_ltp()
-            spot_str = f"₹{spot:.2f}" if spot else "N/A"
-            msg = (
-                f"ℹ️ <b>NO ACTIVE POSITION</b>\n"
-                f"<b>Nifty Spot:</b> {spot_str}\n"
-                f"<b>Daily Trades Completed:</b>"
-                f" {daily_trades_count}/{MAX_DAILY_TRADES}\n"
-                f"<b>Bot Control Status:</b>"
-                f" {'PAUSED' if algo_paused else 'ACTIVE'}"
-            )
-        send_telegram_alert(msg)
-
-    elif cmd == "/close":
-        if pos_active:
-            ltp = get_live_ltp(active_token, active_symbol) or entry_price
-            place_order(active_symbol, active_token, "SELL", active_quantity)
-
-            log_trade(
-                active_symbol,
-                "BUY",
-                entry_price,
-                ltp,
-                active_quantity,
-                "MANUAL_TELEGRAM_EXIT",
-            )
-
-            pnl = round((ltp - entry_price) * active_quantity, 2)
-            send_telegram_alert(
-                f"⚠️ <b>MANUAL EXIT TRIGGERED VIA TELEGRAM</b>\n"
-                f"<b>Symbol:</b> {active_symbol}\n"
-                f"<b>Exit Price:</b> ₹{ltp:.2f}\n"
-                f"<b>PnL:</b> ₹{pnl}"
-            )
-
-            pos_active = False
-            active_symbol = ""
-            active_token = ""
-            active_quantity = 0
-            entry_price = 0.0
-            sl_price = 0.0
-            tgt_price = 0.0
-            highest_price_seen = 0.0
-            tsl_activated = False
-            trade_entry_time = None
-            daily_trades_count += 1
-        else:
-            send_telegram_alert("⚠️ No active position to close.")
-
-    elif cmd == "/pause":
-        algo_paused = True
-        send_telegram_alert(
-            "⏸️ <b>Algo Bot Paused!</b> New trade entries disabled."
-        )
-
-    elif cmd == "/resume":
-        algo_paused = False
-        send_telegram_alert(
-            "▶️ <b>Algo Bot Resumed!</b> Scanning for live entries."
-        )
-
-    elif cmd == "/summary":
-        if os.path.exists(LOG_FILE):
-            try:
-                df_log = pd.read_csv(LOG_FILE)
-                today_str = datetime.now().strftime("%Y-%m-%d")
-                df_today = df_log[
-                    df_log["Timestamp"].astype(str).str.startswith(today_str)
-                ]
-
-                if not df_today.empty:
-                    total_pnl = df_today["PnL_INR"].sum()
-                    wins = len(df_today[df_today["PnL_INR"] > 0])
-                    total_t = len(df_today)
-                    msg = (
-                        f"📈 <b>TODAY'S SUMMARY ({today_str})</b>\n"
-                        f"<b>Total Trades:</b> {total_t}\n"
-                        f"<b>Win Rate:</b> {wins}/{total_t}\n"
-                        f"<b>Net PnL:</b> ₹{total_pnl:.2f}"
-                    )
-                else:
-                    msg = "📄 No trades logged for today yet."
-            except Exception as e:
-                msg = f"⚠️ Error reading trade log: {e}"
-        else:
-            msg = "📄 No trade history log file found."
-        send_telegram_alert(msg)
-
-    elif cmd == "/help":
-        help_msg = (
-            "🤖 <b>AVAILABLE TELEGRAM COMMANDS</b>\n\n"
-            "• <b>/status</b> - View active position & market state\n"
-            "• <b>/close</b> - Force exit open position\n"
-            "• <b>/pause</b> - Pause new trade signals\n"
-            "• <b>/resume</b> - Resume scanning\n"
-            "• <b>/summary</b> - Today's PnL & trade performance\n"
-            "• <b>/help</b> - Show command list"
-        )
-        send_telegram_alert(help_msg)
-
-
-def check_telegram_updates():
-    """Polls Telegram API for commands"""
-    global telegram_last_update_id
-    if not TELEGRAM_BOT_TOKEN:
-        return
-
-    try:
-        url = (
-            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates?offset={telegram_last_update_id"
-            " + 1}&timeout=1"
-        )
-        res = requests.get(url, timeout=3)
-        if res.status_code == 200:
-            data = res.json()
-            if data.get("ok") and data.get("result"):
-                for update in data["result"]:
-                    telegram_last_update_id = update["update_id"]
-                    if "message" in update and "text" in update["message"]:
-                        chat_id = str(update["message"]["chat"]["id"])
-                        if chat_id == str(TELEGRAM_CHAT_ID):
-                            command_text = update["message"]["text"]
-                            process_telegram_command(command_text)
-    except Exception:
-        pass
-
-
-def telegram_listener_thread():
-    while True:
-        check_telegram_updates()
-        time.sleep(2)
 
 
 # ==========================================
@@ -401,16 +217,6 @@ except Exception as e:
     logger.critical(f"Startup Exception: {e}")
     sys.exit(1)
 
-# Start Background Telegram Poller
-try:
-    t_listener = threading.Thread(
-        target=telegram_listener_thread, daemon=True
-    )
-    t_listener.start()
-    logger.info("Telegram Polling Thread Started.")
-except Exception as e:
-    logger.error(f"Telegram Listener Thread Error: {e}")
-
 
 # ==========================================
 # 5. DYNAMIC RISK & POSITION SIZING
@@ -462,105 +268,19 @@ def calculate_dynamic_quantity(option_price):
         return NIFTY_LOT_SIZE
 
 
-# ==========================================
-# 6. WEBSOCKET HANDLERS
-# ==========================================
-def on_data(wsapp, message):
-    global live_ltp_dict
-    try:
-        if isinstance(message, dict):
-            if "token" in message and "last_traded_price" in message:
-                token = str(message["token"])
-                raw_ltp = float(message["last_traded_price"])
-                ltp = raw_ltp / 100.0 if raw_ltp > 100000 else raw_ltp
-                live_ltp_dict[token] = ltp
-
-        elif isinstance(message, list):
-            for tick in message:
-                if (
-                    isinstance(tick, dict)
-                    and "token" in tick
-                    and "last_traded_price" in tick
-                ):
-                    token = str(tick["token"])
-                    raw_ltp = float(tick["last_traded_price"])
-                    ltp = raw_ltp / 100.0 if raw_ltp > 100000 else raw_ltp
-                    live_ltp_dict[token] = ltp
-    except Exception:
-        pass
-
-
-def on_open(wsapp):
-    logger.info("WebSocket Live Feed Connected!")
-
-
-def on_error(wsapp, error):
-    logger.error(f"WebSocket Error: {error}")
-
-
-def on_close(wsapp):
-    logger.info("WebSocket Feed Closed.")
-
-
-def setup_and_subscribe_websocket(token, exchange_type=2):
-    global sws
-    token_str = str(token)
-
-    try:
-        if (
-            sws is not None
-            and hasattr(sws, "is_connected")
-            and sws.is_connected()
-        ):
-            token_list = [
-                {"exchangeType": exchange_type, "tokens": [token_str]}
-            ]
-            sws.subscribe("correlation_id_trade", 1, token_list)
-            logger.info(f"Subscribed Token {token_str} to existing WS")
-            return
-
-        sws = SmartWebSocketV2(auth_token, API_KEY, CLIENT_CODE, feed_token)
-        sws.on_open = on_open
-        sws.on_data = on_data
-        sws.on_error = on_error
-        sws.on_close = on_close
-
-        ws_thread = threading.Thread(target=lambda: sws.connect(), daemon=True)
-        ws_thread.start()
-        time.sleep(2)
-
-        token_list = [{"exchangeType": exchange_type, "tokens": [token_str]}]
-        sws.subscribe("correlation_id_trade", 1, token_list)
-        logger.info(f"WebSocket Active & Subscribed Token: {token_str}")
-
-    except Exception as e:
-        logger.error(f"WebSocket Setup Error: {e}")
-
-
 def get_live_ltp(token, symbol, exchange="NFO"):
-    token_str = str(token)
-    if token_str in live_ltp_dict and live_ltp_dict[token_str] > 0:
-        return live_ltp_dict[token_str]
-
     try:
-        ltp_data = smartApi.ltpData(exchange, symbol, token_str)
+        ltp_data = smartApi.ltpData(exchange, symbol, str(token))
         if ltp_data and ltp_data.get("status") and "data" in ltp_data:
-            ltp = float(ltp_data["data"]["ltp"])
-            live_ltp_dict[token_str] = ltp
-            return ltp
+            return float(ltp_data["data"]["ltp"])
     except Exception as e:
-        logger.error(f"REST API LTP Fallback Error for {symbol}: {e}")
-
+        logger.error(f"REST API LTP Error for {symbol}: {e}")
     return None
 
 
 def get_nifty_spot_ltp():
-    token_str = str(NIFTY_TOKEN)
-    if token_str in live_ltp_dict and live_ltp_dict[token_str] > 0:
-        return live_ltp_dict[token_str]
-
     try:
-        spot_data = smartApi.ltpData("NSE", "NIFTY", token_str)
+        spot_data = smartApi.ltpData("NSE", "NIFTY", str(NIFTY_TOKEN))
         if spot_data and spot_data.get("status") and "data" in spot_data:
             return float(spot_data["data"]["ltp"])
     except Exception as e:
@@ -568,284 +288,62 @@ def get_nifty_spot_ltp():
     return None
 
 
-# Subscribe Nifty Spot to WebSocket Feed (Exchange Type 1 = NSE)
-setup_and_subscribe_websocket(NIFTY_TOKEN, exchange_type=1)
-
-
 # ==========================================
-# 7. OPTION STRIKE SELECTION HELPER
+# 6. SCANNER EXECUTION CYCLE
 # ==========================================
-def get_atm_option_scrip(spot_price, option_type="CE"):
-    """Finds nearest ATM weekly option scrip details"""
-    try:
-        atm_strike = round(spot_price / 50.0) * 50
+def execute_nifty_algo_cycle():
+    """15-Min Interval Algo Scan Execution"""
+    spot_ltp = get_nifty_spot_ltp()
+    if not spot_ltp:
+        logger.error("Unable to fetch Nifty Spot LTP. Exiting cycle.")
+        return
 
-        nifty_df = scrip_master_df[
-            (scrip_master_df["name"] == "NIFTY")
-            & (scrip_master_df["instrumenttype"] == "OPTIDX")
-            & (scrip_master_df["symbol"].str.endswith(option_type))
-        ].copy()
-
-        if nifty_df.empty:
-            return None, None
-
-        nifty_df["strike"] = pd.to_numeric(
-            nifty_df["strike"], errors="coerce"
-        )
-        nifty_df["expiry_dt"] = pd.to_datetime(
-            nifty_df["expiry"], format="%d%b%Y", errors="coerce"
-        )
-
-        today = datetime.now()
-        valid_df = nifty_df[
-            (nifty_df["strike"] == atm_strike)
-            & (nifty_df["expiry_dt"] >= today)
-        ].sort_values(by="expiry_dt")
-
-        if not valid_df.empty:
-            selected_row = valid_df.iloc[0]
-            return selected_row["symbol"], str(selected_row["token"])
-    except Exception as e:
-        logger.error(f"Option Strike Finder Error: {e}")
-
-    return None, None
-
-
-# ==========================================
-# 8. TECHNICAL SIGNAL SCANNER
-# ==========================================
-def fetch_nifty_candles():
-    """Fetches 5-minute candles for RSI & Momentum evaluation"""
-    try:
-        now = datetime.now()
-        to_date = now.strftime("%Y-%m-%d %H:%M")
-        from_date = (now - pd.Timedelta(days=5)).strftime("%Y-%m-%d 09:15")
-
-        param = {
-            "exchange": "NSE",
-            "symboltoken": NIFTY_TOKEN,
-            "interval": "FIVE_MINUTE",
-            "fromdate": from_date,
-            "todate": to_date,
-        }
-
-        candles = smartApi.getCandleData(param)
-        if candles and candles.get("status") and "data" in candles:
-            df = pd.DataFrame(
-                candles["data"],
-                columns=["timestamp", "open", "high", "low", "close", "volume"],
-            )
-            df["close"] = df["close"].astype(float)
-            df["rsi"] = ta.momentum.rsi(df["close"], window=14)
-            df["ema_9"] = ta.trend.ema_indicator(df["close"], window=9)
-            df["ema_21"] = ta.trend.ema_indicator(df["close"], window=21)
-            return df
-    except Exception as e:
-        logger.error(f"Candle Data Fetch Error: {e}")
-    return None
-
-
-def generate_trade_signal():
-    """RSI Momentum + EMA Crossover Strategy"""
-    df = fetch_nifty_candles()
-    if df is None or len(df) < 25:
-        return "NO_TRADE"
-
-    curr = df.iloc[-1]
-    prev = df.iloc[-2]
-
-    # RSI Momentum Threshold >= 60 & EMA Bullish Crossover
-    if (
-        curr["rsi"] >= 60.0
-        and curr["ema_9"] > curr["ema_21"]
-        and prev["ema_9"] <= prev["ema_21"]
-    ):
-        return "BUY_CE"
-
-    # RSI Bearish Breakout <= 40 & EMA Bearish Crossover
-    elif (
-        curr["rsi"] <= 40.0
-        and curr["ema_9"] < curr["ema_21"]
-        and prev["ema_9"] >= prev["ema_21"]
-    ):
-        return "BUY_PE"
-
-    return "NO_TRADE"
-
-
-# ==========================================
-# 9. MAIN RUNTIME LOOP & RISK CONTROLLER
-# ==========================================
-def main_loop():
-    global pos_active, active_symbol, active_token, entry_price, sl_price, tgt_price
-    global highest_price_seen, tsl_activated, active_quantity, trade_entry_time
-    global daily_trades_count, algo_paused
-
-    logger.info("🚀 Nifty Option Algo Bot Started Engine Loop...")
+    logger.info(f"⚡ [NIFTY SCANNER RUN] Nifty Spot LTP: ₹{spot_ltp:.2f}")
+    
+    # Message Alert on Scan Complete
     send_telegram_alert(
-        "🚀 <b>Nifty Option Trading Algo System Active & Live!</b>"
+        f"🎯 <b>Nifty 15-Min Scan Complete</b>\n"
+        f"<b>Spot Level:</b> ₹{spot_ltp:.2f}\n"
+        f"<b>Status:</b> Market Scanned Successfully"
     )
 
-    while True:
-        try:
-            now = datetime.now()
-            current_time = now.time()
 
-            # Market Hours Boundary (09:15 AM - 03:30 PM IST)
-            if not (dtime(9, 15) <= current_time <= dtime(15, 30)):
-                time.sleep(10)
-                continue
-
-            # ----------------------------------------------------
-            # A. ACTIVE POSITION MANAGEMENT (TRAILING SL / EXIT)
-            # ----------------------------------------------------
-            if pos_active:
-                ltp = get_live_ltp(active_token, active_symbol)
-                if not ltp or ltp <= 0:
-                    time.sleep(1)
-                    continue
-
-                if ltp > highest_price_seen:
-                    highest_price_seen = ltp
-
-                holding_mins = (
-                    now - trade_entry_time
-                ).total_seconds() / 60.0
-
-                # 1. Dynamic Trailing Stop-Loss Adjustment
-                if ENABLE_TRAILING_SL:
-                    gain_pct = (highest_price_seen - entry_price) / entry_price
-                    if gain_pct >= TSL_ACTIVATION_PCT:
-                        steps = int(
-                            (gain_pct - TSL_ACTIVATION_PCT)
-                            / TSL_STEP_TRIGGER_PCT
-                        )
-                        new_sl = round(
-                            entry_price * (1 + (steps * TSL_STEP_MOVE_PCT)), 2
-                        )
-                        if new_sl > sl_price:
-                            sl_price = new_sl
-                            tsl_activated = True
-                            send_telegram_alert(
-                                f"📈 <b>TRAILING SL UPDATED</b>\n"
-                                f"<b>Symbol:</b> {active_symbol}\n"
-                                f"<b>New SL:</b> ₹{sl_price:.2f}"
-                            )
-
-                # 2. Check Exit Conditions
-                exit_reason = None
-                if ltp <= sl_price:
-                    exit_reason = (
-                        "TRAILING_STOP_LOSS" if tsl_activated else "STOP_LOSS"
-                    )
-                elif ltp >= tgt_price:
-                    exit_reason = "TARGET_REACHED"
-                elif holding_mins >= MAX_HOLDING_MINUTES:
-                    exit_reason = "TIME_DECAY_EXIT"
-
-                # Execute Exit
-                if exit_reason:
-                    place_order(
-                        active_symbol, active_token, "SELL", active_quantity
-                    )
-                    log_trade(
-                        active_symbol,
-                        "BUY",
-                        entry_price,
-                        ltp,
-                        active_quantity,
-                        exit_reason,
-                    )
-
-                    pnl = round((ltp - entry_price) * active_quantity, 2)
-                    emoji = "🎯" if "TARGET" in exit_reason else "🛑"
-                    send_telegram_alert(
-                        f"{emoji} <b>POSITION CLOSED ({exit_reason})</b>\n"
-                        f"<b>Symbol:</b> {active_symbol}\n"
-                        f"<b>Exit Price:</b> ₹{ltp:.2f}\n"
-                        f"<b>PnL:</b> ₹{pnl}"
-                    )
-
-                    # Reset State
-                    pos_active = False
-                    active_symbol = ""
-                    active_token = ""
-                    active_quantity = 0
-                    entry_price = 0.0
-                    sl_price = 0.0
-                    tgt_price = 0.0
-                    highest_price_seen = 0.0
-                    tsl_activated = False
-                    trade_entry_time = None
-                    daily_trades_count += 1
-
-            # ----------------------------------------------------
-            # B. NEW ENTRY SCANNING
-            # ----------------------------------------------------
-            elif (
-                not pos_active
-                and not algo_paused
-                and daily_trades_count < MAX_DAILY_TRADES
-            ):
-                signal = generate_trade_signal()
-
-                if signal in ["BUY_CE", "BUY_PE"]:
-                    spot = get_nifty_spot_ltp()
-                    if spot and spot > 0:
-                        opt_type = "CE" if signal == "BUY_CE" else "PE"
-                        symbol, token = get_atm_option_scrip(
-                            spot, option_type=opt_type
-                        )
-
-                        if symbol and token:
-                            # Subscribe option to WebSocket feed
-                            setup_and_subscribe_websocket(
-                                token, exchange_type=2
-                            )
-                            time.sleep(1)
-
-                            opt_ltp = get_live_ltp(token, symbol)
-                            if opt_ltp and opt_ltp > 0:
-                                qty = calculate_dynamic_quantity(opt_ltp)
-
-                                # Execute Buy Order
-                                order_id = place_order(
-                                    symbol, token, "BUY", qty
-                                )
-                                if order_id:
-                                    pos_active = True
-                                    active_symbol = symbol
-                                    active_token = token
-                                    active_quantity = qty
-                                    entry_price = opt_ltp
-                                    sl_price = round(
-                                        opt_ltp * (1 - SL_PCT), 2
-                                    )
-                                    tgt_price = round(
-                                        opt_ltp * (1 + TARGET_PCT), 2
-                                    )
-                                    highest_price_seen = opt_ltp
-                                    tsl_activated = False
-                                    trade_entry_time = datetime.now()
-
-                                    send_telegram_alert(
-                                        f"🚀 <b>NEW POSITION ENTERED</b>\n"
-                                        f"<b>Symbol:</b> {symbol}\n"
-                                        f"<b>Entry Price:</b> ₹{entry_price:.2f}\n"
-                                        f"<b>Quantity:</b> {qty}\n"
-                                        f"<b>Initial SL:</b> ₹{sl_price:.2f} (-4.5%)\n"
-                                        f"<b>Target:</b> ₹{tgt_price:.2f} (+15.75%)"
-                                    )
-
-            time.sleep(1)
-
-        except Exception as e:
-            logger.error(f"Error in Main Engine Loop: {e}")
-            time.sleep(2)
-
-
+# ==========================================
+# MAIN SINGLE-RUN ENTRYPOINT FOR CI/CD
+# ==========================================
 if __name__ == "__main__":
-    main_loop()
+    now = datetime.now()
+    # Check Market Hours (Monday-Friday 9:15 AM - 3:30 PM IST)
+    if now.weekday() < 5 and (
+        (now.hour == 9 and now.minute >= 15)
+        or (10 <= now.hour < 15)
+        or (now.hour == 15 and now.minute <= 30)
+    ):
+        execute_nifty_algo_cycle()
+    else:
+        logger.info("Market is Closed. Skipping Nifty Scan.")
+
+# Setup Logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("NiftyAlgo")
+
+# Initialize Tracking Variables Globally
+pos_active = False
+active_symbol = ""
+active_token = ""
+entry_price = 0.0
+sl_price = 0.0
+tgt_price = 0.0
+highest_price_seen = 0.0
+tsl_activated = False
+active_quantity = 0
+trade_entry_time = None
+
+daily_trades_count = 0
+consecutive_sl_count = 0
+consecutive_win_count = 0
+algo_paused = False
+
 
 # ==========================================
 # 1. ORDER EXECUTION WRAPPER
@@ -869,7 +367,7 @@ def place_order(symbol, token, buy_sell_type, quantity, exchange="NFO"):
             f"[ORDER ATTEMPT] {buy_sell_type} {quantity} Qty of {symbol} (Token: {token})"
         )
 
-        if smartApi is not None:
+        if "smartApi" in globals() and smartApi is not None:
             response = smartApi.placeOrder(order_params)
             if (
                 response
@@ -890,8 +388,108 @@ def place_order(symbol, token, buy_sell_type, quantity, exchange="NFO"):
 
 
 # ==========================================
-# 2. OPTION CHAIN & HELPER FUNCTIONS
+# 2. HELPER & DATA INDICATOR FUNCTIONS
 # ==========================================
+def get_atm_option_scrip(spot_price, option_type="CE"):
+    """Finds nearest ATM weekly option scrip details"""
+    try:
+        atm_strike = round(spot_price / 50.0) * 50
+
+        nifty_df = scrip_master_df[
+            (scrip_master_df["name"] == "NIFTY")
+            & (scrip_master_df["instrumenttype"] == "OPTIDX")
+            & (scrip_master_df["symbol"].str.endswith(option_type))
+        ].copy()
+
+        if nifty_df.empty:
+            return None, None
+
+        nifty_df["strike"] = pd.to_numeric(
+            nifty_df["strike"], errors="coerce"
+        )
+        nifty_df["expiry_dt"] = pd.to_datetime(
+            nifty_df["expiry"], errors="coerce"
+        )
+
+        today = datetime.now()
+        valid_df = nifty_df[
+            (nifty_df["strike"] == atm_strike)
+            & (nifty_df["expiry_dt"] >= today)
+        ].sort_values(by="expiry_dt")
+
+        if not valid_df.empty:
+            selected_row = valid_df.iloc[0]
+            return selected_row["symbol"], str(selected_row["token"])
+    except Exception as e:
+        logger.error(f"Option Strike Finder Error: {e}")
+
+    return None, None
+
+
+def fetch_nifty_candles():
+    """Fetches 5-minute candles for RSI & Momentum evaluation"""
+    try:
+        now = datetime.now()
+        to_date = now.strftime("%Y-%m-%d %H:%M")
+        from_date = (now - pd.Timedelta(days=5)).strftime("%Y-%m-%d 09:15")
+
+        param = {
+            "exchange": "NSE",
+            "symboltoken": NIFTY_TOKEN,
+            "interval": "FIVE_MINUTE",
+            "fromdate": from_date,
+            "todate": to_date,
+        }
+
+        candles = smartApi.getCandleData(param)
+        if candles and candles.get("status") and "data" in candles:
+            df = pd.DataFrame(
+                candles["data"],
+                columns=[
+                    "timestamp",
+                    "open",
+                    "high",
+                    "low",
+                    "close",
+                    "volume",
+                ],
+            )
+            df["close"] = df["close"].astype(float)
+            df["rsi"] = ta.momentum.rsi(df["close"], window=14)
+            df["ema_9"] = ta.trend.ema_indicator(df["close"], window=9)
+            df["ema_21"] = ta.trend.ema_indicator(df["close"], window=21)
+            return df
+    except Exception as e:
+        logger.error(f"Candle Data Fetch Error: {e}")
+    return None
+
+
+def generate_trade_signal():
+    """RSI Momentum + EMA Crossover Strategy"""
+    df = fetch_nifty_candles()
+    if df is None or len(df) < 25:
+        return "NO_TRADE"
+
+    curr = df.iloc[-1]
+    prev = df.iloc[-2]
+
+    if (
+        curr["rsi"] >= 60.0
+        and curr["ema_9"] > curr["ema_21"]
+        and prev["ema_9"] <= prev["ema_21"]
+    ):
+        return "CE"
+
+    elif (
+        curr["rsi"] <= 40.0
+        and curr["ema_9"] < curr["ema_21"]
+        and prev["ema_9"] >= prev["ema_21"]
+    ):
+        return "PE"
+
+    return "NO_TRADE"
+
+
 def validate_trade_with_option_chain(
     signal, current_price, pcr, resistance_strike, support_strike
 ):
@@ -945,7 +543,7 @@ def get_option_chain_pcr_and_levels(spot_price):
     """Derives PCR, Support, and Resistance from option chain data"""
     chain_data = fetch_option_chain_data(spot_price)
     if not chain_data:
-        return 1.0, spot_price + 200, spot_price - 200  # Fallback neutral values
+        return 1.0, spot_price + 200, spot_price - 200
 
     df_chain = pd.DataFrame(chain_data)
     ce_df = df_chain[df_chain["option_type"] == "CE"]
@@ -956,13 +554,11 @@ def get_option_chain_pcr_and_levels(spot_price):
 
     pcr = round(total_pe_oi / total_ce_oi, 2) if total_ce_oi > 0 else 1.0
 
-    # Key resistance: strike with max CE Open Interest
     resistance = (
         ce_df.loc[ce_df["open_interest"].idxmax()]["strike"]
         if not ce_df.empty
         else spot_price + 200
     )
-    # Key support: strike with max PE Open Interest
     support = (
         pe_df.loc[pe_df["open_interest"].idxmax()]["strike"]
         if not pe_df.empty
@@ -1011,10 +607,6 @@ def get_15m_trend():
                 return (
                     "BULLISH" if curr["close"] > curr["ema_200"] else "BEARISH"
                 )
-            else:
-                logger.warning(
-                    "15m Trend Warning: Insufficient bars for EMA 200"
-                )
     except Exception as e:
         logger.error(f"15m Trend Fetch Error: {e}")
 
@@ -1059,43 +651,111 @@ def cleanup_position():
             logger.warning(f"Failed to unsubscribe token {active_token}: {e}")
 
     pos_active = False
-    active_symbol = None
-    active_token = None
+    active_symbol = ""
+    active_token = ""
     highest_price_seen = 0.0
 
 
 # ==========================================
-# 3. REFACTORED MAIN ENGINE EXECUTION LOOP
+# 3. MAIN RUNTIME LOOP & ENGINE CONTROLLER
 # ==========================================
-logger.info(
-    ">>> Nifty Auto Bot Active (Auto Entry + Risk Rules + Trailing SL)..."
-)
-send_telegram_alert(
-    "🤖 <b>Nifty Auto-Bot Activated!</b>\n"
-    "Rule 1: 2 Losses -> Stop Trading.\n"
-    "Rule 2: 3 Profits -> Stop Trading."
-)
+def main_loop():
+    global pos_active, active_symbol, active_token, entry_price, sl_price, tgt_price
+    global highest_price_seen, tsl_activated, active_quantity, trade_entry_time
+    global daily_trades_count, consecutive_sl_count, consecutive_win_count, algo_paused
 
-while True:
-    try:
-        if is_market_open():
-            close, signal = fetch_signals_and_data()
+    logger.info("🚀 Nifty Option Algo Bot Started Engine Loop...")
+    send_telegram_alert(
+        "🚀 <b>Nifty Option Trading Algo Active!</b>\n"
+        "Rule 1: 2 Losses -> Stop Trading.\n"
+        "Rule 2: 3 Profits -> Stop Trading."
+    )
 
-            if close is not None:
-                # --------------------------------------------------
-                # 1. AUTO SQUARE-OFF AT 03:10 PM
-                # --------------------------------------------------
-                if is_squareoff_time() and pos_active:
-                    ltp = (
-                        get_live_ltp(active_token, active_symbol)
-                        or entry_price
+    while True:
+        try:
+            if not is_market_open():
+                print(
+                    "\r⏸️ Market Closed. Waiting for market session...",
+                    end="",
+                    flush=True,
+                )
+                time.sleep(10)
+                continue
+
+            # 1. AUTO SQUARE-OFF AT 03:10 PM
+            if is_squareoff_time() and pos_active:
+                ltp = (
+                    get_live_ltp(active_token, active_symbol) or entry_price
+                )
+                logger.info(
+                    f"[AUTO SQUARE-OFF 03:10 PM] Exiting {active_symbol} at ₹{ltp:.2f}"
+                )
+
+                place_order(
+                    active_symbol,
+                    active_token,
+                    "SELL",
+                    active_quantity,
+                )
+                log_trade(
+                    active_symbol,
+                    "BUY",
+                    entry_price,
+                    ltp,
+                    active_quantity,
+                    "AUTO_SQUARE_OFF",
+                )
+                send_telegram_alert(
+                    f"⏰ <b>AUTO SQUARE-OFF (03:10 PM)</b>\n"
+                    f"<b>Symbol:</b> {active_symbol}\n"
+                    f"<b>Exit Price:</b> ₹{ltp:.2f}\n"
+                    f"<b>PnL:</b> ₹{round((ltp - entry_price) * active_quantity, 2)}"
+                )
+
+                cleanup_position()
+                daily_trades_count += 1
+
+            # 2. ACTIVE POSITION MONITOR & TRAILING SL
+            elif pos_active:
+                ltp = get_live_ltp(active_token, active_symbol) or entry_price
+                now = datetime.now()
+                holding_time_mins = (
+                    now - trade_entry_time
+                ).total_seconds() / 60.0
+
+                if ltp > highest_price_seen:
+                    highest_price_seen = ltp
+
+                if ENABLE_TRAILING_SL:
+                    gain_pct = (
+                        highest_price_seen - entry_price
+                    ) / entry_price
+                    if gain_pct >= TSL_ACTIVATION_PCT:
+                        steps = int(
+                            (gain_pct - TSL_ACTIVATION_PCT)
+                            / TSL_STEP_TRIGGER_PCT
+                        )
+                        new_sl = round(
+                            entry_price * (1 + (steps * TSL_STEP_MOVE_PCT)),
+                            2,
+                        )
+                        if new_sl > sl_price:
+                            sl_price = new_sl
+                            tsl_activated = True
+                            logger.info(
+                                f"[TRAILING SL UPDATED] Raised SL to ₹{sl_price:.2f}"
+                            )
+
+                # --- STOP LOSS CHECK ---
+                if ltp <= sl_price:
+                    reason = (
+                        "TRAILING_SL_HIT" if tsl_activated else "INITIAL_SL_HIT"
                     )
-                    logger.info(
-                        f"[AUTO SQUARE-OFF 03:10 PM] Exiting {active_symbol} at ₹{ltp:.2f}"
-                    )
-
                     place_order(
-                        active_symbol, active_token, "SELL", active_quantity
+                        active_symbol,
+                        active_token,
+                        "SELL",
+                        active_quantity,
                     )
                     log_trade(
                         active_symbol,
@@ -1103,10 +763,10 @@ while True:
                         entry_price,
                         ltp,
                         active_quantity,
-                        "AUTO_SQUARE_OFF",
+                        reason,
                     )
                     send_telegram_alert(
-                        f"⏰ <b>AUTO SQUARE-OFF (03:10 PM)</b>\n"
+                        f"🔴 <b>STOP LOSS HIT ({reason})</b>\n"
                         f"<b>Symbol:</b> {active_symbol}\n"
                         f"<b>Exit Price:</b> ₹{ltp:.2f}\n"
                         f"<b>PnL:</b> ₹{round((ltp - entry_price) * active_quantity, 2)}"
@@ -1114,257 +774,171 @@ while True:
 
                     cleanup_position()
                     daily_trades_count += 1
+                    consecutive_sl_count += 1
+                    consecutive_win_count = 0
 
-                # --------------------------------------------------
-                # 2. ACTIVE POSITION MONITOR & TRAILING SL
-                # --------------------------------------------------
-                elif pos_active:
-                    ltp = (
-                        get_live_ltp(active_token, active_symbol)
-                        or entry_price
+                # --- TARGET CHECK ---
+                elif ltp >= tgt_price:
+                    place_order(
+                        active_symbol,
+                        active_token,
+                        "SELL",
+                        active_quantity,
                     )
-                    holding_time_mins = (
-                        datetime.now() - trade_entry_time
-                    ).total_seconds() / 60.0
-
-                    if ENABLE_TRAILING_SL:
-                        if ltp > highest_price_seen:
-                            highest_price_seen = ltp
-
-                        gain_pct = (
-                            highest_price_seen - entry_price
-                        ) / entry_price
-                        if gain_pct >= TSL_ACTIVATION_PCT:
-                            steps = int(
-                                (gain_pct - TSL_ACTIVATION_PCT)
-                                / TSL_STEP_TRIGGER_PCT
-                            )
-                            new_sl = round(
-                                entry_price
-                                * (1 + (steps * TSL_STEP_MOVE_PCT)),
-                                2,
-                            )
-                            if new_sl > sl_price:
-                                sl_price = new_sl
-                                logger.info(
-                                    f"[TRAILING SL UPDATED] Raised SL to ₹{sl_price:.2f}"
-                                )
-
-                    print(
-                        f"\r[POS ACTIVE] {active_symbol} | LTP: ₹{ltp:.2f} | SL: ₹{sl_price:.2f} | TGT: ₹{tgt_price:.2f} | Time: {holding_time_mins:.1f}m/{MAX_HOLDING_MINUTES}m",
-                        end="",
-                        flush=True,
+                    log_trade(
+                        active_symbol,
+                        "BUY",
+                        entry_price,
+                        ltp,
+                        active_quantity,
+                        "TARGET_ACHIEVED",
+                    )
+                    send_telegram_alert(
+                        f"🟢 <b>TARGET ACHIEVED</b> 🎉\n"
+                        f"<b>Symbol:</b> {active_symbol}\n"
+                        f"<b>Exit Price:</b> ₹{ltp:.2f}\n"
+                        f"<b>PnL:</b> ₹{round((ltp - entry_price) * active_quantity, 2)}"
                     )
 
-                    # --- STOP LOSS CHECK ---
-                    if ltp <= sl_price:
-                        reason = (
-                            "TRAILING_SL_HIT"
-                            if sl_price > (entry_price * (1 - SL_PCT))
-                            else "INITIAL_SL_HIT"
-                        )
-                        logger.info(
-                            f"[EXIT SL] {reason} for {active_symbol} at ₹{ltp:.2f}"
-                        )
+                    cleanup_position()
+                    daily_trades_count += 1
+                    consecutive_win_count += 1
+                    consecutive_sl_count = 0
 
-                        place_order(
-                            active_symbol,
-                            active_token,
-                            "SELL",
-                            active_quantity,
-                        )
-                        log_trade(
-                            active_symbol,
-                            "BUY",
-                            entry_price,
-                            ltp,
-                            active_quantity,
-                            reason,
-                        )
-                        send_telegram_alert(
-                            f"🔴 <b>STOP LOSS HIT ({reason})</b>\n"
-                            f"<b>Symbol:</b> {active_symbol}\n"
-                            f"<b>Exit Price:</b> ₹{ltp:.2f}\n"
-                            f"<b>PnL:</b> ₹{round((ltp - entry_price) * active_quantity, 2)}"
-                        )
+                # --- TIME EXIT (THETA TIMEOUT) ---
+                elif holding_time_mins >= MAX_HOLDING_MINUTES:
+                    place_order(
+                        active_symbol,
+                        active_token,
+                        "SELL",
+                        active_quantity,
+                    )
+                    log_trade(
+                        active_symbol,
+                        "BUY",
+                        entry_price,
+                        ltp,
+                        active_quantity,
+                        "THETA_TIMEOUT",
+                    )
+                    send_telegram_alert(
+                        f"⏱️ <b>THETA TIMEOUT EXIT</b>\n"
+                        f"<b>Symbol:</b> {active_symbol}\n"
+                        f"<b>Exit Price:</b> ₹{ltp:.2f}\n"
+                        f"<b>PnL:</b> ₹{round((ltp - entry_price) * active_quantity, 2)}"
+                    )
 
-                        cleanup_position()
-                        daily_trades_count += 1
+                    cleanup_position()
+                    daily_trades_count += 1
+                    if ltp < entry_price:
                         consecutive_sl_count += 1
                         consecutive_win_count = 0
 
-                    # --- TARGET CHECK ---
-                    elif ltp >= tgt_price:
-                        logger.info(
-                            f"[EXIT TARGET] Target Hit for {active_symbol} at ₹{ltp:.2f}"
-                        )
-
-                        place_order(
-                            active_symbol,
-                            active_token,
-                            "SELL",
-                            active_quantity,
-                        )
-                        log_trade(
-                            active_symbol,
-                            "BUY",
-                            entry_price,
-                            ltp,
-                            active_quantity,
-                            "TARGET_ACHIEVED",
-                        )
-                        send_telegram_alert(
-                            f"🟢 <b>TARGET ACHIEVED</b> 🎉\n"
-                            f"<b>Symbol:</b> {active_symbol}\n"
-                            f"<b>Exit Price:</b> ₹{ltp:.2f}\n"
-                            f"<b>PnL:</b> ₹{round((ltp - entry_price) * active_quantity, 2)}"
-                        )
-
-                        cleanup_position()
-                        daily_trades_count += 1
-                        consecutive_win_count += 1
-                        consecutive_sl_count = 0
-
-                    # --- TIME EXIT (THETA TIMEOUT) ---
-                    elif holding_time_mins >= MAX_HOLDING_MINUTES:
-                        logger.info(
-                            f"[EXIT THETA TIMEOUT] Auto-Exiting {active_symbol} at ₹{ltp:.2f}"
-                        )
-
-                        place_order(
-                            active_symbol,
-                            active_token,
-                            "SELL",
-                            active_quantity,
-                        )
-                        log_trade(
-                            active_symbol,
-                            "BUY",
-                            entry_price,
-                            ltp,
-                            active_quantity,
-                            "THETA_TIMEOUT",
-                        )
-                        send_telegram_alert(
-                            f"⏱️ <b>THETA TIMEOUT EXIT</b>\n"
-                            f"<b>Symbol:</b> {active_symbol}\n"
-                            f"<b>Exit Price:</b> ₹{ltp:.2f}\n"
-                            f"<b>PnL:</b> ₹{round((ltp - entry_price) * active_quantity, 2)}"
-                        )
-
-                        cleanup_position()
-                        daily_trades_count += 1
-                        if ltp < entry_price:
-                            consecutive_sl_count += 1
-                            consecutive_win_count = 0
-
-                # --------------------------------------------------
-                # 3. AUTOMATIC TRADE ENTRY (WITH INTEGRATED OPTION CHAIN FILTER)
-                # --------------------------------------------------
-                elif (
-                    not pos_active
-                    and signal in ["CE", "PE"]
-                    and not algo_paused
-                    and is_new_entry_allowed()
-                ):
-                    vix = get_india_vix()
-                    macro_trend = get_15m_trend()
-                    pcr, res_strike, sup_strike = (
-                        get_option_chain_pcr_and_levels(close)
+            # 3. NEW ENTRY SCANNING
+            elif (
+                not pos_active
+                and not algo_paused
+                and is_new_entry_allowed()
+            ):
+                if daily_trades_count >= MAX_DAILY_TRADES:
+                    print(
+                        f"\r🛑 Max Daily Limit ({MAX_DAILY_TRADES}) Reached.",
+                        end="",
+                        flush=True,
                     )
-
-                    # Validate against Option Chain PCR & Levels
-                    is_oc_valid = validate_trade_with_option_chain(
-                        signal, close, pcr, res_strike, sup_strike
+                elif consecutive_sl_count >= 2:
+                    print(
+                        "\r🛑 2 Consecutive Losses Hit! Stopping entries.",
+                        end="",
+                        flush=True,
                     )
+                elif consecutive_win_count >= 3:
+                    print(
+                        "\r🎉 3 Consecutive Wins Hit! Stopping entries.",
+                        end="",
+                        flush=True,
+                    )
+                else:
+                    signal = generate_trade_signal()
 
-                    # Risk & Macro Gateways
-                    if not (MIN_VIX <= vix <= MAX_VIX):
-                        logger.info(
-                            f"Entry Blocked: VIX ({vix}) out of bounds"
-                        )
-                    elif not is_oc_valid:
-                        logger.info(
-                            "Entry Blocked: Failed Option Chain validation"
-                        )
-                    elif signal == "CE" and macro_trend == "BEARISH":
-                        logger.info(
-                            "Entry Blocked: 15m Trend is BEARISH, cannot take CE"
-                        )
-                    elif signal == "PE" and macro_trend == "BULLISH":
-                        logger.info(
-                            "Entry Blocked: 15m Trend is BULLISH, cannot take PE"
-                        )
-                    elif daily_trades_count >= MAX_DAILY_TRADES:
-                        print(
-                            f"\r🛑 Max Daily Limit ({MAX_DAILY_TRADES}) Reached.",
-                            end="",
-                            flush=True,
-                        )
-                    elif consecutive_sl_count >= 2:
-                        print(
-                            "\r🛑 2 Consecutive Losses Hit! Stopping entries.",
-                            end="",
-                            flush=True,
-                        )
-                    elif consecutive_win_count >= 3:
-                        print(
-                            "\r🎉 3 Consecutive Wins Hit! Stopping entries.",
-                            end="",
-                            flush=True,
-                        )
-                    else:
-                        sym, tok = get_itm_symbol_and_token(close, signal)
-                        if sym and tok:
-                            opt_ltp = get_live_ltp(tok, sym)
-                            if opt_ltp is None:
-                                opt_data = smartApi.ltpData("NFO", sym, tok)
-                                if (
-                                    opt_data
-                                    and opt_data.get("status")
-                                    and "data" in opt_data
-                                ):
-                                    opt_ltp = float(opt_data["data"]["ltp"])
+                    if signal in ["CE", "PE"]:
+                        spot = get_nifty_spot_ltp()
+                        if spot and spot > 0:
+                            vix = get_india_vix()
+                            macro_trend = get_15m_trend()
+                            pcr, res_strike, sup_strike = (
+                                get_option_chain_pcr_and_levels(spot)
+                            )
 
-                            if opt_ltp and opt_ltp > 0:
-                                qty = calculate_dynamic_quantity(opt_ltp)
-                                order_id = place_order(
-                                    sym, tok, "BUY", qty
+                            is_oc_valid = validate_trade_with_option_chain(
+                                signal, spot, pcr, res_strike, sup_strike
+                            )
+
+                            if not (MIN_VIX <= vix <= MAX_VIX):
+                                logger.info(
+                                    f"Entry Blocked: VIX ({vix}) out of bounds"
+                                )
+                            elif not is_oc_valid:
+                                logger.info(
+                                    "Entry Blocked: Failed Option Chain validation"
+                                )
+                            elif signal == "CE" and macro_trend == "BEARISH":
+                                logger.info(
+                                    "Entry Blocked: 15m Trend is BEARISH, cannot take CE"
+                                )
+                            elif signal == "PE" and macro_trend == "BULLISH":
+                                logger.info(
+                                    "Entry Blocked: 15m Trend is BULLISH, cannot take PE"
+                                )
+                            else:
+                                sym, tok = get_atm_option_scrip(
+                                    spot, option_type=signal
                                 )
 
-                                if order_id:
-                                    active_symbol = sym
-                                    active_token = tok
-                                    entry_price = opt_ltp
-                                    sl_price = round(
-                                        opt_ltp * (1 - SL_PCT), 2
-                                    )
-                                    tgt_price = round(
-                                        opt_ltp * (1 + TARGET_PCT), 2
-                                    )
-                                    highest_price_seen = opt_ltp
-                                    active_quantity = qty
-                                    trade_entry_time = datetime.now()
-                                    pos_active = True
+                                if sym and tok:
+                                    opt_ltp = get_live_ltp(tok, sym)
+                                    if opt_ltp and opt_ltp > 0:
+                                        qty = calculate_dynamic_quantity(
+                                            opt_ltp
+                                        )
+                                        order_id = place_order(
+                                            sym, tok, "BUY", qty
+                                        )
 
-                                    setup_and_subscribe_websocket(tok)
-                                    send_telegram_alert(
-                                        f"🚀 <b>NEW AUTO-TRADE ENTERED ({signal})</b>\n"
-                                        f"<b>Symbol:</b> {sym}\n"
-                                        f"<b>Entry Price:</b> ₹{entry_price:.2f}\n"
-                                        f"<b>SL:</b> ₹{sl_price:.2f}\n"
-                                        f"<b>Target:</b> ₹{tgt_price:.2f}\n"
-                                        f"<b>Qty:</b> {qty}"
-                                    )
+                                        if order_id:
+                                            pos_active = True
+                                            active_symbol = sym
+                                            active_token = tok
+                                            active_quantity = qty
+                                            entry_price = opt_ltp
+                                            sl_price = round(
+                                                opt_ltp * (1 - SL_PCT), 2
+                                            )
+                                            tgt_price = round(
+                                                opt_ltp * (1 + TARGET_PCT), 2
+                                            )
+                                            highest_price_seen = opt_ltp
+                                            tsl_activated = False
+                                            trade_entry_time = datetime.now()
 
-        else:
-            print(
-                "\r⏸️ Market Closed. Waiting for market session...",
-                end="",
-                flush=True,
-            )
+                                            setup_and_subscribe_websocket(
+                                                tok, exchange_type=2
+                                            )
+                                            send_telegram_alert(
+                                                f"🚀 <b>NEW AUTO-TRADE ENTERED ({signal})</b>\n"
+                                                f"<b>Symbol:</b> {sym}\n"
+                                                f"<b>Entry Price:</b> ₹{entry_price:.2f}\n"
+                                                f"<b>SL:</b> ₹{sl_price:.2f}\n"
+                                                f"<b>Target:</b> ₹{tgt_price:.2f}\n"
+                                                f"<b>Qty:</b> {qty}"
+                                            )
 
-    except Exception as main_e:
-        logger.error(f"Main Loop Exception: {main_e}")
+            time.sleep(1)
 
-    time.sleep(3)
+        except Exception as main_e:
+            logger.error(f"Main Engine Exception: {main_e}")
+            time.sleep(2)
+
+
+if __name__ == "__main__":
+    main_loop()
