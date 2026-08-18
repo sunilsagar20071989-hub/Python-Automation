@@ -25,9 +25,18 @@ jobs:
           python -m pip install --upgrade pip
           pip install pandas requests ta pyotp smartapi-python python-dotenv logzero websocket-client
 
+      - name: Create .env file
+        run: |
+          echo "SMARTAPI_API_KEY=${{ secrets.SMARTAPI_API_KEY }}" >> .env
+          echo "SMARTAPI_CLIENT_CODE=${{ secrets.SMARTAPI_CLIENT_CODE }}" >> .env
+          echo "SMARTAPI_PIN=${{ secrets.SMARTAPI_PIN }}" >> .env
+          echo "SMARTAPI_TOTP_SECRET=${{ secrets.SMARTAPI_TOTP_SECRET }}" >> .env
+          echo "TELEGRAM_BOT_TOKEN=${{ secrets.TELEGRAM_BOT_TOKEN }}" >> .env
+          echo "TELEGRAM_CHAT_ID=${{ secrets.TELEGRAM_CHAT_ID }}" >> .env
+
       - name: Execute Live Intraday & F&O Screeners
         env:
-          SMARTAPI_API_KEY: ${{ secrets.SMARTAPI_KEY }}
+          SMARTAPI_API_KEY: ${{ secrets.SMARTAPI_API_KEY }}
           SMARTAPI_CLIENT_CODE: ${{ secrets.SMARTAPI_CLIENT_CODE }}
           SMARTAPI_PIN: ${{ secrets.SMARTAPI_PIN }}
           SMARTAPI_TOTP_SECRET: ${{ secrets.SMARTAPI_TOTP_SECRET }}
