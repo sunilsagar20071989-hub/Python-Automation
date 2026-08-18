@@ -56,7 +56,6 @@ MIN_WEEKLY_RSI = 55.0
 ENABLE_200_EMA_FILTER = True  # Strict institutional trend filter
 
 # LIVE MONITORING CONFIG
-SCAN_INTERVAL_MINUTES = 15
 MAX_WORKERS = (
     3  # Reduced workers to comply with Angel One API Rate Limits (3 req/sec)
 )
@@ -356,25 +355,14 @@ def run_live_scanner():
         print("=" * 80 + "\n")
 
 
-# MAIN AUTO-SCHEDULER LOOP
+# SINGLE EXECUTION TRIGGER FOR CI/CD & WORKFLOWS
 if __name__ == "__main__":
-    send_telegram_alert(
-        "🤖 <b>Dual-Timeframe Screener Bot Online!</b> Listening for live"
-        " breakouts..."
-    )
-
-    while True:
-        now = datetime.now()
-        if now.weekday() < 5 and (
-            (now.hour == 9 and now.minute >= 15)
-            or (10 <= now.hour < 15)
-            or (now.hour == 15 and now.minute <= 30)
-        ):
-            run_live_scanner()
-            logger.info(
-                f"Sleeping for {SCAN_INTERVAL_MINUTES} minutes until next cycle..."
-            )
-            time.sleep(SCAN_INTERVAL_MINUTES * 60)
-        else:
-            logger.info("Market is Closed. Waiting for market hours...")
-            time.sleep(300)
+    now = datetime.now()
+    if now.weekday() < 5 and (
+        (now.hour == 9 and now.minute >= 15)
+        or (10 <= now.hour < 15)
+        or (now.hour == 15 and now.minute <= 30)
+    ):
+        run_live_scanner()
+    else:
+        logger.info("Market is Closed. Skipping scan for this trigger.")
