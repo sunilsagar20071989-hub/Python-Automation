@@ -1,68 +1,41 @@
-name: Automated FNO & Nifty Strategy Pipeline
+name: Live Market Hours Stock Screener (1-Hour Schedule)
 
 on:
-  workflow_dispatch:
   schedule:
-    # 3:45 AM UTC (9:15 AM IST) से 10:00 AM UTC (3:30 PM IST) तक हर 15 मिनट में चलेगा
-    - cron: '*/15 3-10 * * 1-5'
+    # Monday to Friday: Har 1 ghante par (9:15 AM, 10:15 AM, 11:15 AM, 12:15 PM, 1:15 PM, 2:15 PM, 3:15 PM IST)
+    - cron: '15 3-9 * * 1-5'
+  # Manual trigger option testing ke liye
+  workflow_dispatch:
 
 jobs:
-  run-all-strategies:
+  run-live-screeners:
     runs-on: ubuntu-latest
 
     steps:
-    - name: Checkout Code Repository
-      uses: actions/checkout@v4
+      - name: Checkout Repository
+        uses: actions/checkout@v4
 
-    - name: Set up Python Environment
-      uses: actions/setup-python@v5
-      with:
-        python-version: '3.12'
+      - name: Set up Python Environment
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
 
-    - name: Install Required Libraries
-      run: |
-        python -m pip install --upgrade pip
-        pip install pandas pyotp ta requests logzero smartapi-python python-dotenv websocket-client
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas requests ta pyotp smartapi-python python-dotenv
 
-    - name: Execute All Trading & Screening Scripts
-      env:
-        # SmartAPI Key Mappings
-        SMARTAPI_API_KEY: ${{ secrets.SMARTAPI_API_KEY }}
-        SMARTAPI_KEY: ${{ secrets.SMARTAPI_API_KEY }}
-        API_KEY: ${{ secrets.SMARTAPI_API_KEY }}
-        ANGEL_API_KEY: ${{ secrets.SMARTAPI_API_KEY }}
-        
-        # Client Code Mappings
-        SMARTAPI_CLIENT_CODE: ${{ secrets.SMARTAPI_CLIENT_CODE }}
-        CLIENT_CODE: ${{ secrets.SMARTAPI_CLIENT_CODE }}
-        USER_ID: ${{ secrets.SMARTAPI_CLIENT_CODE }}
-        ANGEL_CLIENT_CODE: ${{ secrets.SMARTAPI_CLIENT_CODE }}
-        
-        # PIN Mappings
-        SMARTAPI_PIN: ${{ secrets.SMARTAPI_PIN }}
-        PIN: ${{ secrets.SMARTAPI_PIN }}
-        PWD: ${{ secrets.SMARTAPI_PIN }}
-        PASSWORD: ${{ secrets.SMARTAPI_PIN }}
-        
-        # TOTP Mappings
-        SMARTAPI_TOTP_SECRET: ${{ secrets.SMARTAPI_TOTP_SECRET }}
-        TOTP_SECRET: ${{ secrets.SMARTAPI_TOTP_SECRET }}
-        TOKEN: ${{ secrets.SMARTAPI_TOTP_SECRET }}
-        TOTP_KEY: ${{ secrets.SMARTAPI_TOTP_SECRET }}
-        
-        # Telegram Mappings
-        TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-        TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-        BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-        TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-      run: |
-        python nifty_stock_fno_master_screener.py
-        python fno_option_15min_screener.py
-        python advanced_stock_screener.py
-        python nifty_algo.py
-        python nifty_algo_paper.py
-        python backtest.py
-        python fetch_trades.py
-        python telegram_bot.py &
-        python intraday_screener.py
+      - name: Execute Live Intraday & F&O Screeners
+        env:
+          SMARTAPI_KEY: ${{ secrets.SMARTAPI_KEY }}
+          SMARTAPI_CLIENT_CODE: ${{ secrets.SMARTAPI_CLIENT_CODE }}
+          SMARTAPI_PIN: ${{ secrets.SMARTAPI_PIN }}
+          SMARTAPI_TOTP_SECRET: ${{ secrets.SMARTAPI_TOTP_SECRET }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          python nifty_stock_fno_master_screener.py
+          python fno_option_15min_screener.py
+          python advanced_stock_screener.py
+          python intraday_screener.py
+          python nifty_algo.py
