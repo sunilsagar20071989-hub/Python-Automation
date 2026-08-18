@@ -1,13 +1,13 @@
-name: Stocks hourly Screener Workflow
+name: Nifty 15-Min Algo Workflow
 
 on:
   schedule:
-    # Runs every hour at minute 15 during trading hours (03:45 UTC to 09:45 UTC = 9:15 AM to 3:15 PM IST)
-    - cron: '15 4-10 * * 1-5'
+    # Runs every 15 minutes during trading hours (9:15 AM to 3:30 PM IST)
+    - cron: '*/15 4-9 * * 1-5'
   workflow_dispatch: # Manual run button for testing
 
 jobs:
-  run-stock-screeners:
+  run-nifty-algo:
     runs-on: ubuntu-latest
 
     steps:
@@ -22,9 +22,10 @@ jobs:
       - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
+          pip install pandas requests pyotp smartapi-python python-dotenv ta
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
-      - name: Run Stock Screeners
+      - name: Run Nifty Algo
         env:
           SMARTAPI_KEY: ${{ secrets.SMARTAPI_KEY }}
           SMARTAPI_CLIENT_CODE: ${{ secrets.SMARTAPI_CLIENT_CODE }}
@@ -33,7 +34,4 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
-          python nifty_stock_fno_master_screener.py
-          python fno_option_15min_screener.py
-          python advanced_stock_screener.py
-          python intraday_screener.py
+          python nifty_algo.py
