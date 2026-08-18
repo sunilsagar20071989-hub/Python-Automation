@@ -1,21 +1,20 @@
-name: Live Market Hours Stock Screener (1-Hour Schedule)
+name: Stocks hourly Screener Workflow
 
 on:
   schedule:
-    # Monday to Friday: Har 1 ghante par (9:15 AM, 10:15 AM, 11:15 AM, 12:15 PM, 1:15 PM, 2:15 PM, 3:15 PM IST)
-    - cron: '15 3-9 * * 1-5'
-  # Manual trigger option testing ke liye
-  workflow_dispatch:
+    # Runs every hour at minute 15 during trading hours (03:45 UTC to 09:45 UTC = 9:15 AM to 3:15 PM IST)
+    - cron: '15 4-10 * * 1-5'
+  workflow_dispatch: # Manual run button for testing
 
 jobs:
-  run-live-screeners:
+  run-stock-screeners:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout Repository
+      - name: Checkout Code
         uses: actions/checkout@v4
 
-      - name: Set up Python Environment
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
@@ -23,20 +22,11 @@ jobs:
       - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pandas requests ta pyotp smartapi-python python-dotenv logzero websocket-client
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
-      - name: Create .env file
-        run: |
-          echo "SMARTAPI_API_KEY=${{ secrets.SMARTAPI_API_KEY }}" >> .env
-          echo "SMARTAPI_CLIENT_CODE=${{ secrets.SMARTAPI_CLIENT_CODE }}" >> .env
-          echo "SMARTAPI_PIN=${{ secrets.SMARTAPI_PIN }}" >> .env
-          echo "SMARTAPI_TOTP_SECRET=${{ secrets.SMARTAPI_TOTP_SECRET }}" >> .env
-          echo "TELEGRAM_BOT_TOKEN=${{ secrets.TELEGRAM_BOT_TOKEN }}" >> .env
-          echo "TELEGRAM_CHAT_ID=${{ secrets.TELEGRAM_CHAT_ID }}" >> .env
-
-      - name: Execute Live Intraday & F&O Screeners
+      - name: Run Stock Screeners
         env:
-          SMARTAPI_API_KEY: ${{ secrets.SMARTAPI_API_KEY }}
+          SMARTAPI_KEY: ${{ secrets.SMARTAPI_KEY }}
           SMARTAPI_CLIENT_CODE: ${{ secrets.SMARTAPI_CLIENT_CODE }}
           SMARTAPI_PIN: ${{ secrets.SMARTAPI_PIN }}
           SMARTAPI_TOTP_SECRET: ${{ secrets.SMARTAPI_TOTP_SECRET }}
