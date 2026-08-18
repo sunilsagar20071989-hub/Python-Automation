@@ -2,8 +2,8 @@ from datetime import datetime
 import json
 import os
 import threading
-from dotenv import load_dotenv
 import time
+from dotenv import load_dotenv
 import pandas as pd
 import pyotp
 import requests
@@ -14,24 +14,38 @@ import ta
 # ==========================================
 # 1. CREDENTIALS & RISK PARAMETERS
 # ==========================================
-# `.env` file load karein
 load_dotenv()
 
-# Fallback ke saath environment variables read karein
-API_KEY = os.getenv("SMARTAPI_KEY", "N7XNbnkE")
-CLIENT_CODE = os.getenv("SMARTAPI_CLIENT_CODE", "S885143")
-PIN = os.getenv("SMARTAPI_PIN", "1989")
-TOTP_SECRET = os.getenv("SMARTAPI_TOTP_SECRET", "ZH76UOCDHM4TITQGDKN32HBZEI")
+# Secure Environment Variables (Fallback for naming conventions)
+API_KEY = os.getenv("SMARTAPI_KEY") or os.getenv("SMARTAPI_API_KEY")
+CLIENT_CODE = os.getenv("SMARTAPI_CLIENT_CODE")
+PIN = os.getenv("SMARTAPI_PIN")
+TOTP_SECRET = os.getenv("SMARTAPI_TOTP_SECRET")
 
-TELEGRAM_BOT_TOKEN = os.getenv(
-    "TELEGRAM_BOT_TOKEN", "8560792327:AAErjHTU4LlKxlueD4c-EXxS2KcqVwBrDN8"
-)
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "1427460047")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-# Optimized Parameters
+# Dynamic Credentials Validation
+missing_vars = []
+if not API_KEY:
+    missing_vars.append("SMARTAPI_KEY/SMARTAPI_API_KEY")
+if not CLIENT_CODE:
+    missing_vars.append("SMARTAPI_CLIENT_CODE")
+if not PIN:
+    missing_vars.append("SMARTAPI_PIN")
+if not TOTP_SECRET:
+    missing_vars.append("SMARTAPI_TOTP_SECRET")
+
+if missing_vars:
+    print(
+        f">>> Error: Missing environment credentials: {', '.join(missing_vars)}"
+    )
+    exit(1)
+
+# Risk Parameters
 SL_PCT = 0.045  # 4.5% Stop Loss
 TARGET_PCT = 0.125  # 12.5% Target
-LOT_SIZE = 65  # Nifty Lot Size (Updated NSE Rule)
+LOT_SIZE = 65  # Nifty Lot Size
 NIFTY_TOKEN = "99926000"
 
 MAX_DAILY_TRADES = 4
@@ -70,286 +84,294 @@ def log_trade_to_csv(
     exit_time,
     pnl,
 ):
-  log_data = {
-      "Date": [datetime.now().strftime("%Y-%m-%d")],
-      "Symbol": [symbol],
-      "Entry Time": [entry_time.strftime("%H:%M:%S") if entry_time else ""],
-      "Exit Time": [exit_time.strftime("%H:%M:%S") if exit_time else ""],
-      "Entry Price": [round(entry_p, 2)],
-      "SL Price": [round(sl_p, 2)],
-      "Target Price": [round(tgt_p, 2)],
-      "Exit Price": [round(exit_p, 2)],
-      "P&L (Rs)": [round(pnl, 2)],
-      "Exit Reason": [exit_reason],
-  }
-  df_log = pd.DataFrame(log_data)
-  file_exists = os.path.exists("daily_trade_log.csv")
-  df_log.to_csv(
-      "daily_trade_log.csv", mode="a", header=not file_exists, index=False
-  )
+    log_data = {
+        "Date": [datetime.now().strftime("%Y-%m-%d")],
+        "Symbol": [symbol],
+        "Entry Time": [entry_time.strftime("%H:%M:%S") if entry_time else ""],
+        "Exit Time": [exit_time.strftime("%H:%M:%S") if exit_time else ""],
+        "Entry Price": [round(entry_p, 2)],
+        "SL Price": [round(sl_p, 2)],
+        "Target Price": [round(tgt_p, 2)],
+        "Exit Price": [round(exit_p, 2)],
+        "P&L (Rs)": [round(pnl, 2)],
+        "Exit Reason": [exit_reason],
+    }
+    df_log = pd.DataFrame(log_data)
+    file_exists = os.path.exists("daily_trade_log.csv")
+    df_log.to_csv(
+        "daily_trade_log.csv", mode="a", header=not file_exists, index=False
+    )
 
 
 # ==========================================
 # 2. LOGIN & SCRIP MASTER SETUP
 # ==========================================
 try:
-  totp = pyotp.TOTP(TOTP_SECRET).now()
-  smartApi = SmartConnect(api_key=API_KEY)
-  data = smartApi.generateSession(CLIENT_CODE, PIN, totp)
+    totp = pyotp.TOTP(TOTP_SECRET).now()
+    smartApi = SmartConnect(api_key=API_KEY)
+    data = smartApi.generateSession(CLIENT_CODE, PIN, totp)
 
-  auth_token = data["data"]["jwtToken"]
-  feed_token = smartApi.getfeedToken()
-  print(">>> SmartAPI Login Successful for Live Trading!")
+    if not data or not data.get("status"):
+        print(">>> SmartAPI Session Generation Failed:", data)
+        exit(1)
 
-  urls = [
-      "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json",
-      "https://margincalculator.angelone.in/OpenAPI_File/files/OpenAPIScripMaster.json",
-  ]
-  headers = {"User-Agent": "Mozilla/5.0"}
-  scrip_loaded = False
+    auth_token = data["data"]["jwtToken"]
+    feed_token = smartApi.getfeedToken()
+    print(">>> SmartAPI Login Successful for Live Trading!")
 
-  for scrip_url in urls:
-    try:
-      res = requests.get(scrip_url, headers=headers, timeout=25)
-      if res.status_code == 200:
-        scrip_master_df = pd.DataFrame(res.json())
-        scrip_loaded = True
-        print(">>> Scrip Master Loaded Successfully!")
-        break
-    except Exception:
-      continue
+    urls = [
+        "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json",
+        "https://margincalculator.angelone.in/OpenAPI_File/files/OpenAPIScripMaster.json",
+    ]
+    headers = {"User-Agent": "Mozilla/5.0"}
+    scrip_loaded = False
 
-  if not scrip_loaded:
-    raise Exception("Failed to download Scrip Master JSON.")
+    for scrip_url in urls:
+        try:
+            res = requests.get(scrip_url, headers=headers, timeout=25)
+            if res.status_code == 200:
+                scrip_master_df = pd.DataFrame(res.json())
+                scrip_loaded = True
+                print(">>> Scrip Master Loaded Successfully!")
+                break
+        except Exception:
+            continue
+
+    if not scrip_loaded:
+        raise Exception("Failed to download Scrip Master JSON.")
 except Exception as e:
-  print(">>> Login / Startup Error:", e)
-  exit()
+    print(">>> Login / Startup Error:", e)
+    exit(1)
 
 
 # ==========================================
 # 3. WEBSOCKET HANDLERS
 # ==========================================
 def on_data(wsapp, message):
-  global live_ltp_dict
-  try:
-    if "token" in message and "last_traded_price" in message:
-      token = str(message["token"])
-      ltp = float(message["last_traded_price"]) / 100.0
-      live_ltp_dict[token] = ltp
-  except Exception:
-    pass
+    global live_ltp_dict
+    try:
+        if "token" in message and "last_traded_price" in message:
+            token = str(message["token"])
+            ltp = float(message["last_traded_price"]) / 100.0
+            live_ltp_dict[token] = ltp
+    except Exception:
+        pass
 
 
 def on_open(wsapp):
-  print(">>> WebSocket Live Feed Connected!")
+    print(">>> WebSocket Live Feed Connected!")
 
 
 def on_error(wsapp, error):
-  pass
+    pass
 
 
 def on_close(wsapp):
-  print(">>> WebSocket Live Feed Closed.")
+    print(">>> WebSocket Live Feed Closed.")
 
 
 def setup_and_subscribe_websocket(token, exchange_type=2):
-  global sws
-  try:
-    if sws is None:
-      sws = SmartWebSocketV2(auth_token, API_KEY, CLIENT_CODE, feed_token)
-      sws.on_open = on_open
-      sws.on_data = on_data
-      sws.on_error = on_error
-      sws.on_close = on_close
-      threading.Thread(target=sws.connect, daemon=True).start()
-      time.sleep(2)
+    global sws
+    try:
+        if sws is None:
+            sws = SmartWebSocketV2(
+                auth_token, API_KEY, CLIENT_CODE, feed_token
+            )
+            sws.on_open = on_open
+            sws.on_data = on_data
+            sws.on_error = on_error
+            sws.on_close = on_close
+            threading.Thread(target=sws.connect, daemon=True).start()
+            time.sleep(2)
 
-    token_list = [{"exchangeType": exchange_type, "tokens": [str(token)]}]
-    sws.subscribe("correlation_id_trade", 1, token_list)
-    print(f">>> Subscribed WebSocket LTP for Token: {token}")
-  except Exception as e:
-    print(">>> WebSocket Setup Error:", e)
+        token_list = [{"exchangeType": exchange_type, "tokens": [str(token)]}]
+        sws.subscribe("correlation_id_trade", 1, token_list)
+        print(f">>> Subscribed WebSocket LTP for Token: {token}")
+    except Exception as e:
+        print(">>> WebSocket Setup Error:", e)
 
 
 def get_live_ltp(token, symbol):
-  if str(token) in live_ltp_dict and live_ltp_dict[str(token)] > 0:
-    return live_ltp_dict[str(token)]
-  try:
-    ltp_data = smartApi.ltpData("NFO", symbol, token)
-    if ltp_data.get("status") and "data" in ltp_data:
-      return float(ltp_data["data"]["ltp"])
-  except Exception:
-    pass
-  return None
+    if str(token) in live_ltp_dict and live_ltp_dict[str(token)] > 0:
+        return live_ltp_dict[str(token)]
+    try:
+        ltp_data = smartApi.ltpData("NFO", symbol, token)
+        if ltp_data.get("status") and "data" in ltp_data:
+            return float(ltp_data["data"]["ltp"])
+    except Exception:
+        pass
+    return None
 
 
 # ==========================================
 # 4. HELPER FUNCTIONS
 # ==========================================
 def is_market_open():
-  now = datetime.now().time()
-  return (
-      datetime.strptime("09:15", "%H:%M").time()
-      <= now
-      <= datetime.strptime("15:15", "%H:%M").time()
-  )
+    now = datetime.now().time()
+    return (
+        datetime.strptime("09:15", "%H:%M").time()
+        <= now
+        <= datetime.strptime("15:15", "%H:%M").time()
+    )
 
 
 def is_new_entry_allowed():
-  now = datetime.now().time()
-  return (
-      datetime.strptime("09:20", "%H:%M").time()
-      <= now
-      <= datetime.strptime("14:45", "%H:%M").time()
-  )
+    now = datetime.now().time()
+    return (
+        datetime.strptime("09:20", "%H:%M").time()
+        <= now
+        <= datetime.strptime("14:45", "%H:%M").time()
+    )
 
 
 def is_squareoff_time():
-  return datetime.now().time() >= datetime.strptime("15:10", "%H:%M").time()
+    return datetime.now().time() >= datetime.strptime("15:10", "%H:%M").time()
 
 
 def get_itm_symbol_and_token(spot_price, option_type):
-  atm = round(spot_price / 50) * 50
-  target_strike = (atm - 100) if option_type == "CE" else (atm + 100)
+    atm = round(spot_price / 50) * 50
+    target_strike = (atm - 100) if option_type == "CE" else (atm + 100)
 
-  try:
-    cols = {c.lower(): c for c in scrip_master_df.columns}
-    name_col, inst_col = cols.get("name", "name"), cols.get(
-        "instrumenttype", "instrumenttype"
-    )
-    strike_col, sym_col = cols.get("strike", "strike"), cols.get(
-        "symbol", "symbol"
-    )
-    token_col, expiry_col = cols.get("token", "token"), cols.get(
-        "expiry", "expiry"
-    )
-
-    filtered = scrip_master_df[
-        (scrip_master_df[name_col].astype(str).str.upper() == "NIFTY")
-        & (scrip_master_df[inst_col].astype(str).str.upper() == "OPTIDX")
-        & (
-            scrip_master_df[strike_col].astype(float)
-            == float(target_strike * 100)
+    try:
+        cols = {c.lower(): c for c in scrip_master_df.columns}
+        name_col, inst_col = cols.get("name", "name"), cols.get(
+            "instrumenttype", "instrumenttype"
         )
-        & (scrip_master_df[sym_col].astype(str).str.endswith(option_type))
-    ].copy()
+        strike_col, sym_col = cols.get("strike", "strike"), cols.get(
+            "symbol", "symbol"
+        )
+        token_col, expiry_col = cols.get("token", "token"), cols.get(
+            "expiry", "expiry"
+        )
 
-    if not filtered.empty:
-      filtered["expiry_dt"] = pd.to_datetime(
-          filtered[expiry_col], format="%d%b%Y", errors="coerce"
-      )
-      today = pd.to_datetime(datetime.now().date())
-      valid_expiries = filtered[filtered["expiry_dt"] >= today].sort_values(
-          "expiry_dt"
-      )
+        filtered = scrip_master_df[
+            (scrip_master_df[name_col].astype(str).str.upper() == "NIFTY")
+            & (scrip_master_df[inst_col].astype(str).str.upper() == "OPTIDX")
+            & (
+                scrip_master_df[strike_col].astype(float)
+                == float(target_strike * 100)
+            )
+            & (scrip_master_df[sym_col].astype(str).str.endswith(option_type))
+        ].copy()
 
-      if not valid_expiries.empty:
-        selected_row = valid_expiries.iloc[0]
-        return str(selected_row[sym_col]), str(selected_row[token_col])
-  except Exception as e:
-    print(">>> Dynamic Token Lookup Exception:", e)
+        if not filtered.empty:
+            filtered["expiry_dt"] = pd.to_datetime(
+                filtered[expiry_col], format="%d%b%Y", errors="coerce"
+            )
+            today = pd.to_datetime(datetime.now().date())
+            valid_expiries = filtered[
+                filtered["expiry_dt"] >= today
+            ].sort_values("expiry_dt")
 
-  return None, None
+            if not valid_expiries.empty:
+                selected_row = valid_expiries.iloc[0]
+                return str(selected_row[sym_col]), str(selected_row[token_col])
+    except Exception as e:
+        print(">>> Dynamic Token Lookup Exception:", e)
+
+    return None, None
 
 
 def fetch_signals_and_data():
-  to_date = datetime.now().strftime("%Y-%m-%d %H:%M")
-  from_date = (datetime.now() - pd.Timedelta(days=5)).strftime("%Y-%m-%d %H:%M")
+    to_date = datetime.now().strftime("%Y-%m-%d %H:%M")
+    from_date = (datetime.now() - pd.Timedelta(days=5)).strftime(
+        "%Y-%m-%d %H:%M"
+    )
 
-  param = {
-      "exchange": "NSE",
-      "symboltoken": NIFTY_TOKEN,
-      "interval": "FIVE_MINUTE",
-      "fromdate": from_date,
-      "todate": to_date,
-  }
+    param = {
+        "exchange": "NSE",
+        "symboltoken": NIFTY_TOKEN,
+        "interval": "FIVE_MINUTE",
+        "fromdate": from_date,
+        "todate": to_date,
+    }
 
-  try:
-    resp = smartApi.getCandleData(param)
-    if resp.get("status") and resp.get("data"):
-      df = pd.DataFrame(
-          resp["data"],
-          columns=["timestamp", "open", "high", "low", "close", "volume"],
-      )
-      df["close"] = df["close"].astype(float)
-      df["high"] = df["high"].astype(float)
-      df["low"] = df["low"].astype(float)
-      df["volume"] = df["volume"].astype(float)
+    try:
+        resp = smartApi.getCandleData(param)
+        if resp and resp.get("status") and resp.get("data"):
+            df = pd.DataFrame(
+                resp["data"],
+                columns=["timestamp", "open", "high", "low", "close", "volume"],
+            )
+            df["close"] = df["close"].astype(float)
+            df["high"] = df["high"].astype(float)
+            df["low"] = df["low"].astype(float)
+            df["volume"] = df["volume"].astype(float)
 
-      df["rsi"] = ta.momentum.rsi(df["close"], window=14)
-      df["roc"] = ta.momentum.roc(df["close"], window=12)
-      df["ema_9"] = ta.trend.ema_indicator(df["close"], window=9)
-      df["ema_21"] = ta.trend.ema_indicator(df["close"], window=21)
-      df["ema_44"] = ta.trend.ema_indicator(df["close"], window=44)
-      df["ema_200"] = ta.trend.ema_indicator(df["close"], window=200)
-      df["vol_sma20"] = df["volume"].rolling(window=20).mean()
+            df["rsi"] = ta.momentum.rsi(df["close"], window=14)
+            df["roc"] = ta.momentum.roc(df["close"], window=12)
+            df["ema_9"] = ta.trend.ema_indicator(df["close"], window=9)
+            df["ema_21"] = ta.trend.ema_indicator(df["close"], window=21)
+            df["ema_44"] = ta.trend.ema_indicator(df["close"], window=44)
+            df["ema_200"] = ta.trend.ema_indicator(df["close"], window=200)
+            df["vol_sma20"] = df["volume"].rolling(window=20).mean()
 
-      curr, prev = df.iloc[-1], df.iloc[-2]
+            curr, prev = df.iloc[-1], df.iloc[-2]
 
-      bullish_cross = (prev["ema_9"] <= prev["ema_21"]) and (
-          curr["ema_9"] > curr["ema_21"]
-      )
-      bearish_cross = (prev["ema_9"] >= prev["ema_21"]) and (
-          curr["ema_9"] < curr["ema_21"]
-      )
+            bullish_cross = (prev["ema_9"] <= prev["ema_21"]) and (
+                curr["ema_9"] > curr["ema_21"]
+            )
+            bearish_cross = (prev["ema_9"] >= prev["ema_21"]) and (
+                curr["ema_9"] < curr["ema_21"]
+            )
 
-      bounce_ce = (curr["low"] <= curr["ema_44"] * 1.002) and (
-          curr["close"] > curr["ema_44"]
-      )
-      reject_pe = (curr["high"] >= curr["ema_44"] * 0.998) and (
-          curr["close"] < curr["ema_44"]
-      )
+            bounce_ce = (curr["low"] <= curr["ema_44"] * 1.002) and (
+                curr["close"] > curr["ema_44"]
+            )
+            reject_pe = (curr["high"] >= curr["ema_44"] * 0.998) and (
+                curr["close"] < curr["ema_44"]
+            )
 
-      vol_confirm = curr["volume"] >= (curr["vol_sma20"] * 0.9)
-      ce_confirm = (
-          (curr["rsi"] >= 58)
-          and (curr["roc"] > 0.1)
-          and (curr["close"] > curr["ema_200"])
-          and vol_confirm
-      )
-      pe_confirm = (
-          (curr["rsi"] <= 42)
-          and (curr["roc"] < -0.1)
-          and (curr["close"] < curr["ema_200"])
-          and vol_confirm
-      )
+            vol_confirm = curr["volume"] >= (curr["vol_sma20"] * 0.9)
+            ce_confirm = (
+                (curr["rsi"] >= 58)
+                and (curr["roc"] > 0.1)
+                and (curr["close"] > curr["ema_200"])
+                and vol_confirm
+            )
+            pe_confirm = (
+                (curr["rsi"] <= 42)
+                and (curr["roc"] < -0.1)
+                and (curr["close"] < curr["ema_200"])
+                and vol_confirm
+            )
 
-      signal = "NO_TRADE"
-      if (bullish_cross or bounce_ce) and ce_confirm:
-        signal = "CE"
-      elif (bearish_cross or reject_pe) and pe_confirm:
-        signal = "PE"
+            signal = "NO_TRADE"
+            if (bullish_cross or bounce_ce) and ce_confirm:
+                signal = "CE"
+            elif (bearish_cross or reject_pe) and pe_confirm:
+                signal = "PE"
 
-      return curr["close"], signal
-  except Exception as e:
-    print(">>> Indicator Fetch Error:", e)
+            return curr["close"], signal
+    except Exception as e:
+        print(">>> Indicator Fetch Error:", e)
 
-  return None, "NO_TRADE"
+    return None, "NO_TRADE"
 
 
 def place_order(symbol, token, buy_sell, quantity):
-  params = {
-      "variety": "NORMAL",
-      "tradingsymbol": symbol,
-      "symboltoken": str(token),
-      "transactiontype": buy_sell,
-      "exchange": "NFO",
-      "ordertype": "MARKET",
-      "producttype": "CARRYFORWARD",
-      "duration": "DAY",
-      "price": "0",
-      "quantity": str(quantity),
-  }
-  try:
-    order_id = smartApi.placeOrder(params)
-    print(
-        f"\n[ORDER EXECUTED] {buy_sell} | ID: {order_id} | Symbol: {symbol} |"
-        f" Qty: {quantity}"
-    )
-    return order_id
-  except Exception as e:
-    print(f">>> Order Execution Error ({buy_sell}):", e)
-    return None
+    params = {
+        "variety": "NORMAL",
+        "tradingsymbol": symbol,
+        "symboltoken": str(token),
+        "transactiontype": buy_sell,
+        "exchange": "NFO",
+        "ordertype": "MARKET",
+        "producttype": "CARRYFORWARD",
+        "duration": "DAY",
+        "price": "0",
+        "quantity": str(quantity),
+    }
+    try:
+        order_id = smartApi.placeOrder(params)
+        print(
+            f"\n[ORDER EXECUTED] {buy_sell} | ID: {order_id} | Symbol:"
+            f" {symbol} | Qty: {quantity}"
+        )
+        return order_id
+    except Exception as e:
+        print(f">>> Order Execution Error ({buy_sell}):", e)
+        return None
 
 
 # ==========================================
@@ -358,170 +380,193 @@ def place_order(symbol, token, buy_sell, quantity):
 print(">>> Nifty Live Execution Engine Active...")
 
 while True:
-  try:
-    today_date = datetime.now().date()
-    if current_trading_day != today_date:
-      current_trading_day = today_date
-      daily_trades_count = 0
-      consecutive_sl_count = 0
+    try:
+        today_date = datetime.now().date()
+        if current_trading_day != today_date:
+            current_trading_day = today_date
+            daily_trades_count = 0
+            consecutive_sl_count = 0
 
-    if is_market_open():
-      if daily_trades_count >= MAX_DAILY_TRADES:
-        print(
-            f"\r🛑 Max Daily Limit ({MAX_DAILY_TRADES} Trades) Reached.", end=""
-        )
-        time.sleep(5)
-        continue
+        if is_market_open():
+            if daily_trades_count >= MAX_DAILY_TRADES:
+                print(
+                    f"\r🛑 Max Daily Limit ({MAX_DAILY_TRADES} Trades)"
+                    " Reached.",
+                    end="",
+                )
+                time.sleep(5)
+                continue
 
-      if consecutive_sl_count >= 2:
-        print("\r🛑 2 Consecutive Stop Loss Hit! Protection Active.", end="")
-        time.sleep(5)
-        continue
+            if consecutive_sl_count >= 2:
+                print(
+                    "\r🛑 2 Consecutive Stop Loss Hit! Protection Active.",
+                    end="",
+                )
+                time.sleep(5)
+                continue
 
-      close, signal = fetch_signals_and_data()
+            close, signal = fetch_signals_and_data()
 
-      if close is not None:
-        # 1. AUTO SQUARE-OFF AT 03:10 PM
-        if is_squareoff_time() and pos_active:
-          ltp = get_live_ltp(active_token, active_symbol) or entry_price
-          exit_time = datetime.now()
-          pnl = (ltp - entry_price) * LOT_SIZE
-          place_order(active_symbol, active_token, "SELL", LOT_SIZE)
+            if close is not None:
+                # 1. AUTO SQUARE-OFF AT 03:10 PM
+                if is_squareoff_time() and pos_active:
+                    ltp = (
+                        get_live_ltp(active_token, active_symbol) or entry_price
+                    )
+                    exit_time = datetime.now()
+                    pnl = (ltp - entry_price) * LOT_SIZE
+                    place_order(active_symbol, active_token, "SELL", LOT_SIZE)
 
-          log_trade_to_csv(
-              active_symbol,
-              entry_price,
-              sl_price,
-              tgt_price,
-              ltp,
-              "03:10 PM Auto Square-Off",
-              trade_entry_time,
-              exit_time,
-              pnl,
-          )
+                    log_trade_to_csv(
+                        active_symbol,
+                        entry_price,
+                        sl_price,
+                        tgt_price,
+                        ltp,
+                        "03:10 PM Auto Square-Off",
+                        trade_entry_time,
+                        exit_time,
+                        pnl,
+                    )
 
-          pos_active = False
-          daily_trades_count += 1
+                    pos_active = False
+                    daily_trades_count += 1
 
-        # 2. REAL-TIME MONITORING
-        elif pos_active:
-          ltp = get_live_ltp(active_token, active_symbol)
-          holding_time_mins = (
-              datetime.now() - trade_entry_time
-          ).total_seconds() / 60.0
+                # 2. REAL-TIME MONITORING
+                elif pos_active:
+                    ltp = get_live_ltp(active_token, active_symbol)
+                    holding_time_mins = (
+                        datetime.now() - trade_entry_time
+                    ).total_seconds() / 60.0
 
-          if ltp is not None:
+                    if ltp is not None:
+                        print(
+                            f"[POS ACTIVE] {active_symbol} | LTP: ₹{ltp:.2f} |"
+                            f" SL: ₹{sl_price:.2f} | TGT: ₹{tgt_price:.2f} |"
+                            f" Time: {holding_time_mins:.1f}m/{MAX_HOLDING_MINUTES}m",
+                            end="\r",
+                        )
+
+                        # EXIT A: STOP LOSS
+                        if ltp <= sl_price:
+                            exit_time = datetime.now()
+                            pnl = (ltp - entry_price) * LOT_SIZE
+                            place_order(
+                                active_symbol, active_token, "SELL", LOT_SIZE
+                            )
+
+                            log_trade_to_csv(
+                                active_symbol,
+                                entry_price,
+                                sl_price,
+                                tgt_price,
+                                ltp,
+                                "Stop Loss Hit (4.5%)",
+                                trade_entry_time,
+                                exit_time,
+                                pnl,
+                            )
+                            pos_active = False
+                            daily_trades_count += 1
+                            consecutive_sl_count += 1
+
+                        # EXIT B: TARGET
+                        elif ltp >= tgt_price:
+                            exit_time = datetime.now()
+                            pnl = (ltp - entry_price) * LOT_SIZE
+                            place_order(
+                                active_symbol, active_token, "SELL", LOT_SIZE
+                            )
+
+                            log_trade_to_csv(
+                                active_symbol,
+                                entry_price,
+                                sl_price,
+                                tgt_price,
+                                ltp,
+                                "Target Hit (12.5%)",
+                                trade_entry_time,
+                                exit_time,
+                                pnl,
+                            )
+                            pos_active = False
+                            daily_trades_count += 1
+                            consecutive_sl_count = 0
+
+                        # EXIT C: THETA TIMEOUT
+                        elif holding_time_mins >= MAX_HOLDING_MINUTES:
+                            exit_time = datetime.now()
+                            pnl = (ltp - entry_price) * LOT_SIZE
+                            place_order(
+                                active_symbol, active_token, "SELL", LOT_SIZE
+                            )
+
+                            log_trade_to_csv(
+                                active_symbol,
+                                entry_price,
+                                sl_price,
+                                tgt_price,
+                                ltp,
+                                "Theta Time Exit (22m)",
+                                trade_entry_time,
+                                exit_time,
+                                pnl,
+                            )
+                            pos_active = False
+                            daily_trades_count += 1
+                            if ltp < entry_price:
+                                consecutive_sl_count += 1
+                            else:
+                                consecutive_sl_count = 0
+
+                # 3. FRESH ENTRY LOGIC
+                elif not pos_active and is_new_entry_allowed():
+                    if signal in ["CE", "PE"]:
+                        sym, tok = get_itm_symbol_and_token(close, signal)
+                        if sym and tok:
+                            order_id = place_order(sym, tok, "BUY", LOT_SIZE)
+                            if order_id:
+                                setup_and_subscribe_websocket(
+                                    tok, exchange_type=2
+                                )
+
+                                # Fetch dynamic fill price with fallback check
+                                retries = 5
+                                fill_price = None
+                                while retries > 0:
+                                    time.sleep(1)
+                                    fill_price = get_live_ltp(tok, sym)
+                                    if fill_price:
+                                        break
+                                    retries -= 1
+
+                                entry_price = fill_price if fill_price else 150.0
+                                sl_price = round(entry_price * (1 - SL_PCT), 2)
+                                tgt_price = round(
+                                    entry_price * (1 + TARGET_PCT), 2
+                                )
+
+                                active_symbol, active_token, pos_active = (
+                                    sym,
+                                    tok,
+                                    True,
+                                )
+                                trade_entry_time = datetime.now()
+                                print(
+                                    f"\n[ENTRY {signal} TRIGGERED] {sym} @"
+                                    f" ₹{entry_price:.2f} | SL:"
+                                    f" ₹{sl_price:.2f} | TGT: ₹{tgt_price:.2f}"
+                                )
+
+        else:
             print(
-                f"[POS ACTIVE] {active_symbol} | LTP: ₹{ltp:.2f} | SL:"
-                f" ₹{sl_price:.2f} | TGT: ₹{tgt_price:.2f} | Time:"
-                f" {holding_time_mins:.1f}m/{MAX_HOLDING_MINUTES}m",
+                f"{datetime.now().strftime('%H:%M:%S')} - Outside Market"
+                " Hours...",
                 end="\r",
             )
 
-            # EXIT A: STOP LOSS
-            if ltp <= sl_price:
-              exit_time = datetime.now()
-              pnl = (ltp - entry_price) * LOT_SIZE
-              place_order(active_symbol, active_token, "SELL", LOT_SIZE)
+        time.sleep(3)
 
-              log_trade_to_csv(
-                  active_symbol,
-                  entry_price,
-                  sl_price,
-                  tgt_price,
-                  ltp,
-                  "Stop Loss Hit (4.5%)",
-                  trade_entry_time,
-                  exit_time,
-                  pnl,
-              )
-              pos_active = False
-              daily_trades_count += 1
-              consecutive_sl_count += 1
-
-            # EXIT B: TARGET
-            elif ltp >= tgt_price:
-              exit_time = datetime.now()
-              pnl = (ltp - entry_price) * LOT_SIZE
-              place_order(active_symbol, active_token, "SELL", LOT_SIZE)
-
-              log_trade_to_csv(
-                  active_symbol,
-                  entry_price,
-                  sl_price,
-                  tgt_price,
-                  ltp,
-                  "Target Hit (12.5%)",
-                  trade_entry_time,
-                  exit_time,
-                  pnl,
-              )
-              pos_active = False
-              daily_trades_count += 1
-              consecutive_sl_count = 0
-
-            # EXIT C: THETA TIMEOUT
-            elif holding_time_mins >= MAX_HOLDING_MINUTES:
-              exit_time = datetime.now()
-              pnl = (ltp - entry_price) * LOT_SIZE
-              place_order(active_symbol, active_token, "SELL", LOT_SIZE)
-
-              log_trade_to_csv(
-                  active_symbol,
-                  entry_price,
-                  sl_price,
-                  tgt_price,
-                  ltp,
-                  "Theta Time Exit (22m)",
-                  trade_entry_time,
-                  exit_time,
-                  pnl,
-              )
-              pos_active = False
-              daily_trades_count += 1
-              if ltp < entry_price:
-                consecutive_sl_count += 1
-              else:
-                consecutive_sl_count = 0
-
-        # 3. FRESH ENTRY LOGIC
-        elif not pos_active and is_new_entry_allowed():
-          if signal in ["CE", "PE"]:
-            sym, tok = get_itm_symbol_and_token(close, signal)
-            if sym and tok:
-              order_id = place_order(sym, tok, "BUY", LOT_SIZE)
-              if order_id:
-                setup_and_subscribe_websocket(tok, exchange_type=2)
-
-                # Fetch dynamic fill price with fallback check
-                retries = 5
-                fill_price = None
-                while retries > 0:
-                  time.sleep(1)
-                  fill_price = get_live_ltp(tok, sym)
-                  if fill_price:
-                    break
-                  retries -= 1
-
-                entry_price = fill_price if fill_price else 150.0
-                sl_price = round(entry_price * (1 - SL_PCT), 2)
-                tgt_price = round(entry_price * (1 + TARGET_PCT), 2)
-
-                active_symbol, active_token, pos_active = sym, tok, True
-                trade_entry_time = datetime.now()
-                print(
-                    f"\n[ENTRY {signal} TRIGGERED] {sym} @ ₹{entry_price:.2f} |"
-                    f" SL: ₹{sl_price:.2f} | TGT: ₹{tgt_price:.2f}"
-                )
-
-    else:
-      print(
-          f"{datetime.now().strftime('%H:%M:%S')} - Outside Market Hours...",
-          end="\r",
-      )
-
-    time.sleep(3)
-
-  except Exception as e:
-    print("\nLoop Exception:", e)
-    time.sleep(5)
+    except Exception as e:
+        print("\nLoop Exception:", e)
+        time.sleep(5)
