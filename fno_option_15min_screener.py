@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta
+from datetime import datetime, time as dtime, timedelta
 import os
 import time
 from dotenv import load_dotenv
@@ -13,25 +13,34 @@ from SmartApi import SmartConnect
 # ==========================================
 load_dotenv()
 
-API_KEY = os.getenv("SMARTAPI_KEY", "N7XNbnkE")
-CLIENT_CODE = os.getenv("SMARTAPI_CLIENT_CODE", "S885143")
-PIN = os.getenv("SMARTAPI_PIN", "1989")
-TOTP_SECRET = os.getenv("SMARTAPI_TOTP_SECRET", "ZH76UOCDHM4TITQGDKN32HBZEI")
+API_KEY = os.getenv("SMARTAPI_KEY")
+CLIENT_CODE = os.getenv("SMARTAPI_CLIENT_CODE")
+PIN = os.getenv("SMARTAPI_PIN")
+TOTP_SECRET = os.getenv("SMARTAPI_TOTP_SECRET")
 
-TELEGRAM_BOT_TOKEN = os.getenv(
-    "TELEGRAM_BOT_TOKEN", "8560792327:AAErjHTU4LlKxlueD4c-EXxS2KcqVwBrDN8"
-)
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "1427460047")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 # STRICT INTRADAY PARAMETERS
-BULL_RSI = 62.0  # Raised for Call options
-BEAR_RSI = 38.0  # Lowered for Put options
+BULL_RSI = 60.0  # Call Option Trigger
+BEAR_RSI = 40.0  # Put Option Trigger
 MIN_VOL_RATIO = 1.5  # Current 15-min volume >= 1.5x of last 20 candles avg
 MAX_GAP_PCT = 1.2  # Avoid high gap-up/gap-down stocks
 
 
 # ==========================================
-# 2. DYNAMIC F&O UNIVERSE FETCH
+# 2. MARKET HOURS FILTER
+# ==========================================
+def is_market_open():
+  """Restricts signals strictly between 09:15 AM to 03:25 PM IST."""
+  now = datetime.now().time()
+  market_start = dtime(9, 15)
+  market_end = dtime(15, 25)
+  return market_start <= now <= market_end
+
+
+# ==========================================
+# 3. DYNAMIC F&O UNIVERSE FETCH
 # ==========================================
 def fetch_dynamic_fno_universe():
   print(
@@ -58,10 +67,7 @@ def fetch_dynamic_fno_universe():
     for _, row in nse_eq_df.iterrows():
       fno_list.append({"symbol": row["symbol"], "token": str(row["token"])})
 
-    print(
-        f">>> Successfully loaded {len(fno_list)} F&O stocks dynamically for"
-        " 15-Min Intraday Scan!\n"
-    )
+    print(f">>> Successfully loaded {len(fno_list)} F&O stocks dynamically!\n")
     return fno_list
 
   except Exception as e:
@@ -70,10 +76,11 @@ def fetch_dynamic_fno_universe():
 
 
 # ==========================================
-# 3. TELEGRAM NOTIFIER FUNCTION
+# 4. TELEGRAM NOTIFIER FUNCTION
 # ==========================================
 def send_telegram_message(message_text):
   if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+    print(">>> Telegram Token/Chat ID missing in environment.")
     return
 
   url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -89,12 +96,14 @@ def send_telegram_message(message_text):
 
 
 # ==========================================
-# 4. LOGIN & AUTHENTICATION
+# 5. LOGIN & AUTHENTICATION
 # ==========================================
 def initialize_smartapi():
   try:
     if not all([API_KEY, CLIENT_CODE, PIN, TOTP_SECRET]):
-      print(">>> Error: API Credentials missing from environment variables.")
+      print(
+          ">>> Error: Credentials missing. Please check your .env configuration."
+      )
       return None
 
     smart_api = SmartConnect(api_key=API_KEY)
@@ -110,7 +119,7 @@ def initialize_smartapi():
       )
       print("\n" + "=" * 95)
       print(
-          ">>> SmartAPI Engine Connected! Dynamic 15-Min High-Conviction F&O"
+          ">>> SmartAPI Connected! Dynamic 15-Min 200 EMA High-Conviction"
           " Scanner Active..."
       )
       print("=" * 95 + "\n")
@@ -121,7 +130,7 @@ def initialize_smartapi():
 
 
 # ==========================================
-# 5. DATA FETCHING & EVALUATION (15-MIN STRICT)
+# 6. DATA FETCHING & EVALUATION (200 EMA + 15-MIN STRICT)
 # ==========================================
 def fetch_live_15min_data(auth_token, token):
   url = "https://apiconnect.angelone.in/rest/secure/angelbroking/historical/v1/getCandleData"
@@ -139,7 +148,8 @@ def fetch_live_15min_data(auth_token, token):
   }
 
   now = datetime.now()
-  from_date = (now - timedelta(days=7)).strftime("%Y-%m-%d 09:15")
+  # 15 days data ensures >= 200 candles for proper 200 EMA calculation
+  from_date = (now - timedelta(days=15)).strftime("%Y-%m-%d 09:15")
   to_date = now.strftime("%Y-%m-%d %H:%M")
 
   payload = {
@@ -180,11 +190,13 @@ def evaluate_realtime_setup(auth_token, stock):
   token = stock["token"]
 
   df = fetch_live_15min_data(auth_token, token)
-  if df is None or len(df) < 30:
+  if df is None or len(df) < 200:  # Ensures minimum candles for 200 EMA
     return None, None
 
+  # TECHNICAL INDICATORS CALCULATION
   df["rsi"] = ta.momentum.rsi(df["close"], window=14)
   df["roc"] = ta.momentum.roc(df["close"], window=12)
+  df["ema_200"] = ta.trend.ema_indicator(df["close"], window=200)
   df["vol_sma"] = df["volume"].rolling(window=20).mean()
 
   curr = df.iloc[-1]
@@ -199,11 +211,11 @@ def evaluate_realtime_setup(auth_token, stock):
 
   gap_percent = ((curr["close"] - prev_day_close) / prev_day_close) * 100
 
-  # Volume Ratio Calculation
+  # Volume Ratio
   vol_ratio = curr["volume"] / curr["vol_sma"] if curr["vol_sma"] > 0 else 0
   vol_pass = vol_ratio >= MIN_VOL_RATIO
 
-  # 1-Hour High/Low Range Breakout Check (Recent 4 candles)
+  # 1-Hour High/Low Range Breakout Check
   recent_4_high = df["high"].iloc[-5:-1].max()
   recent_4_low = df["low"].iloc[-5:-1].min()
 
@@ -212,15 +224,20 @@ def evaluate_realtime_setup(auth_token, stock):
 
   rsi_val = curr["rsi"] if not pd.isna(curr["rsi"]) else 50.0
   roc_val = curr["roc"] if not pd.isna(curr["roc"]) else 0.0
+  ema_200_val = curr["ema_200"]
 
+  # STRICT 200 EMA RULES ENFORCEMENT
   is_bullish = (
-      (rsi_val >= BULL_RSI)
+      (curr["close"] > ema_200_val)  # Price ABOVE 200 EMA for CE
+      and (rsi_val >= BULL_RSI)
       and (roc_val > 0.0)
       and vol_pass
       and is_bullish_breakout
   )
+
   is_bearish = (
-      (rsi_val <= BEAR_RSI)
+      (curr["close"] < ema_200_val)  # Price BELOW 200 EMA for PE
+      and (rsi_val <= BEAR_RSI)
       and (roc_val < 0.0)
       and vol_pass
       and is_bearish_breakout
@@ -257,9 +274,16 @@ def evaluate_realtime_setup(auth_token, stock):
 
 
 # ==========================================
-# 6. MAIN PIPELINE
+# 7. MAIN PIPELINE
 # ==========================================
 def main():
+  if not is_market_open():
+    print(
+        ">>> Market Closed! Execution blocked to prevent late post-market"
+        " signals."
+    )
+    return
+
   auth_token = initialize_smartapi()
   if not auth_token:
     return
@@ -270,22 +294,19 @@ def main():
     return
 
   print(
-      f">>> SCANNING {len(fno_universe)} STOCKS FOR STRICT 15-MIN OPTION"
-      " TRADES...\n"
+      f">>> SCANNING {len(fno_universe)} STOCKS FOR STRICT 200 EMA + 15-MIN"
+      " OPTION TRADES...\n"
   )
-  all_scanned = []
   matches = []
 
   for stock in fno_universe:
-    status, match = evaluate_realtime_setup(auth_token, stock)
-    if status:
-      all_scanned.append(status)
+    _, match = evaluate_realtime_setup(auth_token, stock)
     if match:
       matches.append(match)
     time.sleep(0.08)
 
   print("\n" + "=" * 95)
-  print("         🎯 LIVE HIGH CONVICTION OPTION TRADES (STRICT FILTERS) 🎯")
+  print("  🎯 LIVE HIGH CONVICTION OPTION TRADES (200 EMA FILTERED) 🎯")
   print("=" * 95)
   if matches:
     df_match = pd.DataFrame(matches)
@@ -307,7 +328,9 @@ def main():
     )
     send_telegram_message(telegram_msg_match)
   else:
-    print(">>> ZERO STOCKS MATCHED STRICT REAL-TIME BREAKOUT FILTERS.")
+    print(
+        ">>> ZERO STOCKS MATCHED STRICT REAL-TIME BREAKOUT & 200 EMA FILTERS."
+    )
   print("=" * 95 + "\n")
 
 
