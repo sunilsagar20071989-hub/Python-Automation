@@ -613,15 +613,10 @@ def main_loop():
     )
 
     while True:
-        try:
-            if not is_market_open():
-                print(
-                    "\r⏸️ Market Closed. Waiting for market session...",
-                    end="",
-                    flush=True,
-                )
-                time.sleep(10)
-                continue
+    try:
+        if not is_market_open():
+            print("\n⏸️ Market Closed. Exiting execution cleanly.")
+            sys.exit(0)  # GitHub Actions yahan stop ho jayega aur success mark hoga
 
             # 1. AUTO SQUARE-OFF AT 03:10 PM
             if is_squareoff_time() and pos_active:
