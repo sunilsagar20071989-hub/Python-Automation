@@ -2,12 +2,19 @@ name: Nifty 15-Min Algo Workflow
 
 on:
   schedule:
-    - cron: '*/15 4-9 * * 1-5'
+    # UTC 03:45 to 10:00 (IST 09:15 AM to 03:30 PM) - Monday to Friday
+    - cron: '45 3 * * 1-5'
   workflow_dispatch:
+
+# Prevent duplicate concurrent algo runs
+concurrency:
+  group: nifty-algo-engine
+  cancel-in-progress: true
 
 jobs:
   run-nifty-algo:
     runs-on: ubuntu-latest
+    timeout-minutes: 370 # Auto kill runner after 6 hours (Max market session)
 
     steps:
       - name: Checkout Code
@@ -17,6 +24,7 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
+          cache: 'pip'
 
       - name: Install Dependencies
         run: |
@@ -24,7 +32,7 @@ jobs:
           pip install pandas requests pyotp smartapi-python python-dotenv ta logzero websocket-client
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
-      - name: Run Nifty Algo
+      - name: Run Nifty Algo Engine Loop
         env:
           SMARTAPI_API_KEY: ${{ secrets.SMARTAPI_API_KEY }}
           SMARTAPI_CLIENT_CODE: ${{ secrets.SMARTAPI_CLIENT_CODE }}
@@ -32,5 +40,6 @@ jobs:
           SMARTAPI_TOTP_SECRET: ${{ secrets.SMARTAPI_TOTP_SECRET }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TZ: "Asia/Kolkata" # Sets environment timezone to IST explicitly
         run: |
           python nifty_algo.py
