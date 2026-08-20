@@ -3,7 +3,6 @@
 # ==============================================================================
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import datetime
 from datetime import datetime as dt, time as dtime, timedelta
 import logging
 import os
@@ -13,7 +12,7 @@ import time
 from dotenv import load_dotenv
 import pandas as pd
 import pyotp
-import pytz  # Corrected: Added missing pytz import
+import pytz
 import requests
 import ta
 from SmartApi import SmartConnect
@@ -50,6 +49,9 @@ if missing_vars:
     logger.error(f"Missing environment variables: {', '.join(missing_vars)}")
     sys.exit(1)
 
+# TIMEZONE CONFIGURATION
+IST = pytz.timezone("Asia/Kolkata")
+
 # MULTI-TIMEFRAME MOMENTUM PARAMETERS
 MIN_DAILY_RSI = 60.0
 MIN_DAILY_ROC = 1.0
@@ -58,9 +60,7 @@ MIN_WEEKLY_RSI = 55.0
 ENABLE_200_EMA_FILTER = True  # Strict institutional trend filter
 
 # LIVE MONITORING CONFIG
-MAX_WORKERS = (
-    3  # Reduced workers to comply with Angel One API Rate Limits (3 req/sec)
-)
+MAX_WORKERS = 2  # Rate limit compliant for Angel One (Strict 3 req/sec limit)
 MASTER_FILE_LOCAL = "OpenAPIScripMaster.json"
 
 LOG_FILE = "fno_scan_log.csv"
@@ -68,28 +68,15 @@ smart_api_instance = None
 http_session = requests.Session()
 alerted_stocks_today = set()
 alert_lock = threading.Lock()
-last_alert_reset_date = dt.now().date()
+last_alert_reset_date = dt.now(IST).date()
+cached_fno_universe = None  # Cache universe in memory to reduce I/O
 
 
 # ==========================================
-# 2. TELEGRAM NOTIFICATION & LOGGING ENGINE
+# TELEGRAM NOTIFICATION ENGINE
 # ==========================================
 def send_telegram_alert(message, max_retries=3):
-    """Sends HTML formatted Telegram notifications safely with Time-Filter"""
-
-    # --- Market Hours Time Check (3:15 PM IST Cutoff) ---
-    IST = pytz.timezone("Asia/Kolkata")
-    current_time = datetime.datetime.now(IST).time()
-    cutoff_time = datetime.time(15, 15)  # 3:15 PM Cutoff
-
-    # अगर समय शाम 3:15 बजे के बाद का है, तो मैसेज नहीं भेजा जाएगा
-    if current_time > cutoff_time:
-        print(
-            f"Alert Skipped: Current IST time ({current_time.strftime('%H:%M')}) is past market cutoff (15:15)."
-        )
-        return
-
-    # --- Your Existing Code ---
+    """Sends HTML formatted Telegram notifications safely"""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
 
@@ -102,7 +89,7 @@ def send_telegram_alert(message, max_retries=3):
 
     for attempt in range(max_retries):
         try:
-            response = requests.post(url, data=payload, timeout=5)
+            response = http_session.post(url, data=payload, timeout=5)
             if response.status_code == 200:
                 return
         except requests.exceptions.RequestException as e:
@@ -135,6 +122,10 @@ def initialize_smartapi():
 
 
 def fetch_dynamic_fno_universe():
+    global cached_fno_universe
+    if cached_fno_universe:
+        return cached_fno_universe
+
     urls = [
         "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json",
         "https://margincalculator.angelone.in/OpenAPI_File/files/OpenAPIScripMaster.json",
@@ -143,7 +134,7 @@ def fetch_dynamic_fno_universe():
 
     if os.path.exists(MASTER_FILE_LOCAL):
         file_time = dt.fromtimestamp(os.path.getmtime(MASTER_FILE_LOCAL))
-        if file_time.date() == dt.now().date():
+        if file_time.date() == dt.now(IST).date():
             download_needed = False
 
     if download_needed:
@@ -162,25 +153,22 @@ def fetch_dynamic_fno_universe():
 
     try:
         df_master = pd.read_json(MASTER_FILE_LOCAL)
-        cols = {c.lower(): c for c in df_master.columns}
-        exch_col = cols.get("exch_seg", "exch_seg")
-        name_col = cols.get("name", "name")
-        sym_col = cols.get("symbol", "symbol")
-        token_col = cols.get("token", "token")
+        df_master.columns = [c.lower() for c in df_master.columns]
 
-        nfo_df = df_master[df_master[exch_col] == "NFO"]
-        fno_symbols = set(nfo_df[name_col].dropna().unique())
+        nfo_df = df_master[df_master["exch_seg"] == "NFO"]
+        fno_symbols = set(nfo_df["name"].dropna().unique())
 
         nse_eq_df = df_master[
-            (df_master[exch_col] == "NSE")
-            & (df_master[sym_col].astype(str).str.endswith("-EQ"))
-            & (df_master[name_col].isin(fno_symbols))
+            (df_master["exch_seg"] == "NSE")
+            & (df_master["symbol"].astype(str).str.endswith("-EQ"))
+            & (df_master["name"].isin(fno_symbols))
         ]
 
-        return [
-            {"symbol": str(row[sym_col]), "token": str(row[token_col])}
+        cached_fno_universe = [
+            {"symbol": str(row["symbol"]), "token": str(row["token"])}
             for _, row in nse_eq_df.iterrows()
         ]
+        return cached_fno_universe
     except Exception as e:
         logger.error(f"Error reading Scrip Master File: {e}")
         return []
@@ -200,7 +188,7 @@ def fetch_candle_data_direct(auth_token, token, interval, days):
         "Authorization": auth_token,
     }
 
-    now = dt.now()
+    now = dt.now(IST)
     to_date = now.strftime("%Y-%m-%d %H:%M")
     from_date = (now - timedelta(days=days)).strftime("%Y-%m-%d 09:15")
 
@@ -213,24 +201,24 @@ def fetch_candle_data_direct(auth_token, token, interval, days):
     }
 
     try:
-        candle_data = []
         resp = http_session.post(url, headers=headers, json=payload, timeout=5)
         resp_json = resp.json()
+
         if (
             resp_json.get("status")
             and resp_json.get("data")
             and len(resp_json["data"]) > 0
         ):
-            candle_data = resp_json["data"]
-        elif smart_api_instance is not None:
-            sdk_resp = smart_api_instance.getCandleData(payload)
-            if sdk_resp and sdk_resp.get("status") and sdk_resp.get("data"):
-                candle_data = sdk_resp["data"]
-
-        if candle_data:
             df = pd.DataFrame(
-                candle_data,
-                columns=["timestamp", "open", "high", "low", "close", "volume"],
+                resp_json["data"],
+                columns=[
+                    "timestamp",
+                    "open",
+                    "high",
+                    "low",
+                    "close",
+                    "volume",
+                ],
             )
             df["close"] = df["close"].astype(float)
             df["volume"] = df["volume"].astype(float)
@@ -243,20 +231,20 @@ def fetch_candle_data_direct(auth_token, token, interval, days):
 def analyze_stock_multi_tf(stock, auth_token):
     global alerted_stocks_today, last_alert_reset_date
 
-    # Reset daily tracking set at midnight (Thread-safe)
+    today_ist = dt.now(IST).date()
     with alert_lock:
-        if dt.now().date() != last_alert_reset_date:
+        if today_ist != last_alert_reset_date:
             alerted_stocks_today.clear()
-            last_alert_reset_date = dt.now().date()
+            last_alert_reset_date = today_ist
 
     symbol = stock["symbol"]
     token = stock["token"]
 
-    # Rate Limiter Sleep (Ensures compliance with Angel API rate limit)
-    time.sleep(0.35)
+    # Rate Limiter Sleep (Ensures strict compliance with API limits)
+    time.sleep(0.4)
 
-    # 1. Fetch Daily Data (Minimum 300 days for 200 EMA accuracy)
-    df_daily = fetch_candle_data_direct(auth_token, token, "ONE_DAY", days=350)
+    # 1. Fetch Daily Data
+    df_daily = fetch_candle_data_direct(auth_token, token, "ONE_DAY", days=300)
     if df_daily is None or len(df_daily) < 200:
         return None, None
 
@@ -268,6 +256,9 @@ def analyze_stock_multi_tf(stock, auth_token):
     df_daily["vol_sma20"] = df_daily["volume"].rolling(window=20).mean()
 
     curr_d = df_daily.iloc[-1]
+    if pd.isna(curr_d["rsi"]) or pd.isna(curr_d["roc"]):
+        return None, None
+
     entry_p = round(curr_d["close"], 2)
 
     daily_rsi_pass = curr_d["rsi"] >= MIN_DAILY_RSI
@@ -280,7 +271,6 @@ def analyze_stock_multi_tf(stock, auth_token):
         curr_d["volume"] >= curr_d["vol_sma20"] if REQUIRE_VOL_SURGE else True
     )
 
-    # Initial fast filter check
     if not (
         daily_rsi_pass
         and daily_roc_pass
@@ -290,11 +280,12 @@ def analyze_stock_multi_tf(stock, auth_token):
     ):
         return None, None
 
-    # 2. Fetch Native Weekly Setup (Avoids manual resampling bias)
+    # 2. Fetch Weekly Data ONLY if Daily parameters pass
+    time.sleep(0.4)
     df_weekly = fetch_candle_data_direct(
-        auth_token, token, "ONE_WEEK", days=300
+        auth_token, token, "ONE_WEEK", days=250
     )
-    if df_weekly is None or len(df_weekly) < 20:
+    if df_weekly is None or len(df_weekly) < 15:
         return None, None
 
     df_weekly["w_rsi"] = ta.momentum.rsi(df_weekly["close"], window=14)
@@ -303,6 +294,9 @@ def analyze_stock_multi_tf(stock, auth_token):
     )
 
     curr_w = df_weekly.iloc[-1]
+    if pd.isna(curr_w["w_rsi"]) or pd.isna(curr_w["w_ema21"]):
+        return None, None
+
     weekly_pass = (curr_w["w_rsi"] >= MIN_WEEKLY_RSI) and (
         curr_w["close"] > curr_w["w_ema21"]
     )
@@ -310,7 +304,7 @@ def analyze_stock_multi_tf(stock, auth_token):
     if not weekly_pass:
         return None, None
 
-    # Both Daily & Weekly Aligned
+    # Matches Found
     match_data = {
         "Symbol": symbol,
         "LTP": entry_p,
@@ -354,8 +348,7 @@ def run_live_scanner():
         return
 
     logger.info(
-        f"[{dt.now().strftime('%H:%M:%S')}] Scanning {len(fno_universe)}"
-        " F&O stocks..."
+        f"[{dt.now(IST).strftime('%H:%M:%S')}] Scanning {len(fno_universe)} F&O stocks..."
     )
 
     qualified_matches = []
@@ -378,14 +371,15 @@ def run_live_scanner():
         print("=" * 80 + "\n")
 
 
-# SINGLE EXECUTION TRIGGER FOR CI/CD & WORKFLOWS
+# SINGLE EXECUTION TRIGGER FOR CRON / LIVE LOOPS
 if __name__ == "__main__":
-    now = dt.now()
-    if now.weekday() < 5 and (
-        (now.hour == 9 and now.minute >= 15)
-        or (10 <= now.hour < 15)
-        or (now.hour == 15 and now.minute <= 30)
-    ):
+    now = dt.now(IST)
+    market_start = dtime(9, 15)
+    market_cutoff = dtime(15, 15)
+
+    if now.weekday() < 5 and (market_start <= now.time() <= market_cutoff):
         run_live_scanner()
     else:
-        logger.info("Market is Closed. Skipping scan for this trigger.")
+        logger.info(
+            "Outside live trading hours (Mon-Fri, 09:15-15:15 IST). Skipping scan execution."
+        )
