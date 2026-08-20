@@ -3,7 +3,8 @@
 # ==============================================================================
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, time as dtime, timedelta
+import datetime
+from datetime import datetime as dt, time as dtime, timedelta
 import logging
 import os
 import sys
@@ -12,6 +13,7 @@ import time
 from dotenv import load_dotenv
 import pandas as pd
 import pyotp
+import pytz  # Corrected: Added missing pytz import
 import requests
 import ta
 from SmartApi import SmartConnect
@@ -66,22 +68,47 @@ smart_api_instance = None
 http_session = requests.Session()
 alerted_stocks_today = set()
 alert_lock = threading.Lock()
-last_alert_reset_date = datetime.now().date()
+last_alert_reset_date = dt.now().date()
 
 
-def send_telegram_alert(message):
+# ==========================================
+# 2. TELEGRAM NOTIFICATION & LOGGING ENGINE
+# ==========================================
+def send_telegram_alert(message, max_retries=3):
+    """Sends HTML formatted Telegram notifications safely with Time-Filter"""
+
+    # --- Market Hours Time Check (3:15 PM IST Cutoff) ---
+    IST = pytz.timezone("Asia/Kolkata")
+    current_time = datetime.datetime.now(IST).time()
+    cutoff_time = datetime.time(15, 15)  # 3:15 PM Cutoff
+
+    # अगर समय शाम 3:15 बजे के बाद का है, तो मैसेज नहीं भेजा जाएगा
+    if current_time > cutoff_time:
+        print(
+            f"Alert Skipped: Current IST time ({current_time.strftime('%H:%M')}) is past market cutoff (15:15)."
+        )
+        return
+
+    # --- Your Existing Code ---
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
+
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
         "text": message,
         "parse_mode": "HTML",
     }
-    try:
-        http_session.post(url, data=payload, timeout=5)
-    except Exception as e:
-        logger.error(f"Telegram Alert Exception: {e}")
+
+    for attempt in range(max_retries):
+        try:
+            response = requests.post(url, data=payload, timeout=5)
+            if response.status_code == 200:
+                return
+        except requests.exceptions.RequestException as e:
+            if attempt == max_retries - 1:
+                logger.error(f"Telegram Alert Error: {e}")
+            time.sleep(1)
 
 
 def initialize_smartapi():
@@ -115,10 +142,8 @@ def fetch_dynamic_fno_universe():
     download_needed = True
 
     if os.path.exists(MASTER_FILE_LOCAL):
-        file_time = datetime.fromtimestamp(
-            os.path.getmtime(MASTER_FILE_LOCAL)
-        )
-        if file_time.date() == datetime.now().date():
+        file_time = dt.fromtimestamp(os.path.getmtime(MASTER_FILE_LOCAL))
+        if file_time.date() == dt.now().date():
             download_needed = False
 
     if download_needed:
@@ -175,7 +200,7 @@ def fetch_candle_data_direct(auth_token, token, interval, days):
         "Authorization": auth_token,
     }
 
-    now = datetime.now()
+    now = dt.now()
     to_date = now.strftime("%Y-%m-%d %H:%M")
     from_date = (now - timedelta(days=days)).strftime("%Y-%m-%d 09:15")
 
@@ -220,9 +245,9 @@ def analyze_stock_multi_tf(stock, auth_token):
 
     # Reset daily tracking set at midnight (Thread-safe)
     with alert_lock:
-        if datetime.now().date() != last_alert_reset_date:
+        if dt.now().date() != last_alert_reset_date:
             alerted_stocks_today.clear()
-            last_alert_reset_date = datetime.now().date()
+            last_alert_reset_date = dt.now().date()
 
     symbol = stock["symbol"]
     token = stock["token"]
@@ -231,9 +256,7 @@ def analyze_stock_multi_tf(stock, auth_token):
     time.sleep(0.35)
 
     # 1. Fetch Daily Data (Minimum 300 days for 200 EMA accuracy)
-    df_daily = fetch_candle_data_direct(
-        auth_token, token, "ONE_DAY", days=350
-    )
+    df_daily = fetch_candle_data_direct(auth_token, token, "ONE_DAY", days=350)
     if df_daily is None or len(df_daily) < 200:
         return None, None
 
@@ -331,7 +354,7 @@ def run_live_scanner():
         return
 
     logger.info(
-        f"[{datetime.now().strftime('%H:%M:%S')}] Scanning {len(fno_universe)}"
+        f"[{dt.now().strftime('%H:%M:%S')}] Scanning {len(fno_universe)}"
         " F&O stocks..."
     )
 
@@ -357,7 +380,7 @@ def run_live_scanner():
 
 # SINGLE EXECUTION TRIGGER FOR CI/CD & WORKFLOWS
 if __name__ == "__main__":
-    now = datetime.now()
+    now = dt.now()
     if now.weekday() < 5 and (
         (now.hour == 9 and now.minute >= 15)
         or (10 <= now.hour < 15)
