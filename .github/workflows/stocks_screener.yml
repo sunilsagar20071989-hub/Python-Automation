@@ -36,7 +36,6 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
-          python nifty_stock_fno_master_screener.py
           python fno_option_15min_screener.py
           python advanced_stock_screener.py
           python intraday_screener.py
