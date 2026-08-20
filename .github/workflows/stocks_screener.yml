@@ -1,14 +1,19 @@
-name: Stocks hourly Screener Workflow
+name: Stocks Hourly Screener Workflow
 
 on:
   schedule:
-    # Runs every hour at minute 15 during trading hours (03:45 UTC to 09:45 UTC = 9:15 AM to 3:15 PM IST)
-    - cron: '15 4-10 * * 1-5'
-  workflow_dispatch: # Manual run button for testing
+    # Runs at 09:15 AM IST (03:45 UTC) and then hourly at :15 mins from 09:45 AM to 02:45 PM IST (04:15 UTC to 09:15 UTC)
+    - cron: '45 3, 15 4-9 * * 1-5'
+  workflow_dispatch: # Manual trigger button
+
+concurrency:
+  group: stock-screeners-engine
+  cancel-in-progress: true
 
 jobs:
   run-stock-screeners:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     steps:
       - name: Checkout Code
@@ -18,6 +23,7 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
+          cache: 'pip'
 
       - name: Install Dependencies
         run: |
@@ -25,17 +31,37 @@ jobs:
           pip install pandas requests pyotp smartapi-python python-dotenv ta logzero websocket-client
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
-      - name: Run Stock Screeners
+      - name: Run FnO Option 15Min Screener
         env:
-          SMARTAPI_KEY: ${{ secrets.SMARTAPI_API_KEY }}
           SMARTAPI_API_KEY: ${{ secrets.SMARTAPI_API_KEY }}
-          API_KEY: ${{ secrets.SMARTAPI_API_KEY }}
           SMARTAPI_CLIENT_CODE: ${{ secrets.SMARTAPI_CLIENT_CODE }}
           SMARTAPI_PIN: ${{ secrets.SMARTAPI_PIN }}
           SMARTAPI_TOTP_SECRET: ${{ secrets.SMARTAPI_TOTP_SECRET }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: |
-          python fno_option_15min_screener.py
-          python advanced_stock_screener.py
-          python intraday_screener.py
+          TZ: "Asia/Kolkata"
+        run: python fno_option_15min_screener.py
+
+      - name: Run Advanced Stock Screener
+        if: always() # Runs even if previous step fails
+        env:
+          SMARTAPI_API_KEY: ${{ secrets.SMARTAPI_API_KEY }}
+          SMARTAPI_CLIENT_CODE: ${{ secrets.SMARTAPI_CLIENT_CODE }}
+          SMARTAPI_PIN: ${{ secrets.SMARTAPI_PIN }}
+          SMARTAPI_TOTP_SECRET: ${{ secrets.SMARTAPI_TOTP_SECRET }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TZ: "Asia/Kolkata"
+        run: python advanced_stock_screener.py
+
+      - name: Run Intraday Screener
+        if: always() # Runs even if previous step fails
+        env:
+          SMARTAPI_API_KEY: ${{ secrets.SMARTAPI_API_KEY }}
+          SMARTAPI_CLIENT_CODE: ${{ secrets.SMARTAPI_CLIENT_CODE }}
+          SMARTAPI_PIN: ${{ secrets.SMARTAPI_PIN }}
+          SMARTAPI_TOTP_SECRET: ${{ secrets.SMARTAPI_TOTP_SECRET }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TZ: "Asia/Kolkata"
+        run: python intraday_screener.py
