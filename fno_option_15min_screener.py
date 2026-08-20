@@ -24,7 +24,6 @@ TOTP_SECRET = os.getenv("SMARTAPI_TOTP_SECRET")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-# Dynamic Credentials Validation
 missing_vars = []
 if not API_KEY:
     missing_vars.append("SMARTAPI_KEY/SMARTAPI_API_KEY")
@@ -42,28 +41,26 @@ if missing_vars:
 # STRICT INTRADAY PARAMETERS
 BULL_RSI = 60.0       # Call Option Trigger
 BEAR_RSI = 40.0       # Put Option Trigger
-MIN_VOL_RATIO = 1.5   # Current 15-min volume >= 1.5x of last 20 candles avg
-MAX_GAP_PCT = 1.2     # Avoid high gap-up/gap-down stocks
-MAX_WORKERS = 10      # Fast Multi-threading limit for Angel One API
+MIN_VOL_RATIO = 1.5   # Current volume >= 1.5x of 20 SMA volume
+MAX_GAP_PCT = 1.2     # Filter out extreme gap openings
+MAX_WORKERS = 10      # Multi-threading concurrency worker limit
 
 
 # ==========================================
-# 2. MARKET HOURS FILTER (IST TIMEZONE FIX)
+# 2. MARKET HOURS FILTER
 # ==========================================
 def is_market_open():
-    """Restricts signals strictly between 09:15 AM to 03:25 PM IST."""
+    """Validates execution timeframe between 09:15 AM to 03:25 PM IST."""
     IST = pytz.timezone("Asia/Kolkata")
     now = datetime.now(IST).time()
-    market_start = dtime(9, 15)
-    market_end = dtime(15, 25)
-    return market_start <= now <= market_end
+    return dtime(9, 15) <= now <= dtime(15, 25)
 
 
 # ==========================================
 # 3. DYNAMIC F&O UNIVERSE FETCH
 # ==========================================
 def fetch_dynamic_fno_universe():
-    print(">>> Downloading Angel One Master Instrument File for Dynamic F&O Universe...")
+    print(">>> Downloading Angel One Master Instrument File...")
     urls = [
         "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json",
         "https://margincalculator.angelone.in/OpenAPI_File/files/OpenAPIScripMaster.json",
@@ -77,7 +74,6 @@ def fetch_dynamic_fno_universe():
                 data = resp.json()
                 df_master = pd.DataFrame(data)
 
-                # Column name normalization
                 cols = {c.lower(): c for c in df_master.columns}
                 exch_col = cols.get("exch_seg", "exch_seg")
                 name_col = cols.get("name", "name")
@@ -112,14 +108,13 @@ def fetch_dynamic_fno_universe():
 # ==========================================
 # 4. TELEGRAM NOTIFICATION ENGINE
 # ==========================================
-def send_telegram_alert(message, max_retries=3):
-    """Sends HTML formatted Telegram notifications safely with Time-Filter"""
+def send_telegram_alert(message, bypass_time_check=False, max_retries=3):
+    """Sends HTML formatted Telegram alerts with cutoff override capacity."""
     IST = pytz.timezone("Asia/Kolkata")
     current_time = datetime.now(IST).time()
-    cutoff_time = dtime(15, 15)
 
-    if current_time > cutoff_time:
-        print(f"Alert Skipped: Current IST time ({current_time.strftime('%H:%M')}) is past market cutoff (15:15).")
+    if not bypass_time_check and current_time > dtime(15, 25):
+        print(f"Alert Skipped: Current time ({current_time.strftime('%H:%M')}) past cutoff.")
         return
 
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
@@ -185,7 +180,7 @@ def fetch_live_15min_data(smart_api, auth_token, token):
     }
 
     now = datetime.now()
-    from_date = (now - timedelta(days=15)).strftime("%Y-%m-%d 09:15")
+    from_date = (now - timedelta(days=20)).strftime("%Y-%m-%d 09:15")
     to_date = now.strftime("%Y-%m-%d %H:%M")
 
     payload = {
@@ -228,13 +223,16 @@ def evaluate_realtime_setup(smart_api, auth_token, stock):
     token = stock["token"]
 
     df = fetch_live_15min_data(smart_api, auth_token, token)
-    if df is None or len(df) < 200:
+    if df is None or len(df) < 50:
         return None, None
+
+    # Dynamic EMA Windowing
+    ema_window = 200 if len(df) >= 200 else len(df) - 1
 
     # TECHNICAL INDICATORS CALCULATION
     df["rsi"] = ta.momentum.rsi(df["close"], window=14)
     df["roc"] = ta.momentum.roc(df["close"], window=12)
-    df["ema_200"] = ta.trend.ema_indicator(df["close"], window=200)
+    df["ema_200"] = ta.trend.ema_indicator(df["close"], window=ema_window)
     df["vol_sma"] = df["volume"].rolling(window=20).mean()
 
     curr = df.iloc[-1]
@@ -249,22 +247,23 @@ def evaluate_realtime_setup(smart_api, auth_token, stock):
 
     gap_percent = ((curr["close"] - prev_day_close) / prev_day_close) * 100
 
-    # Volume Ratio
-    vol_ratio = curr["volume"] / curr["vol_sma"] if curr["vol_sma"] > 0 else 0
+    # Volume Ratio Guard
+    vol_sma_val = curr["vol_sma"] if pd.notna(curr["vol_sma"]) and curr["vol_sma"] > 0 else 1.0
+    vol_ratio = curr["volume"] / vol_sma_val
     vol_pass = vol_ratio >= MIN_VOL_RATIO
 
     # Range Breakout Check
-    recent_4_high = df["high"].iloc[-5:-1].max()
-    recent_4_low = df["low"].iloc[-5:-1].min()
+    recent_4_high = df["high"].iloc[-5:-1].max() if len(df) >= 5 else curr["high"]
+    recent_4_low = df["low"].iloc[-5:-1].min() if len(df) >= 5 else curr["low"]
 
     is_bullish_breakout = curr["close"] > recent_4_high
     is_bearish_breakout = curr["close"] < recent_4_low
 
-    rsi_val = curr["rsi"] if not pd.isna(curr["rsi"]) else 50.0
-    roc_val = curr["roc"] if not pd.isna(curr["roc"]) else 0.0
-    ema_200_val = curr["ema_200"]
+    rsi_val = curr["rsi"] if pd.notna(curr["rsi"]) else 50.0
+    roc_val = curr["roc"] if pd.notna(curr["roc"]) else 0.0
+    ema_200_val = curr["ema_200"] if pd.notna(curr["ema_200"]) else curr["close"]
 
-    # STRICT 200 EMA RULES ENFORCEMENT
+    # STRICT STRATEGY EVALUATION
     is_bullish = (
         (curr["close"] > ema_200_val)
         and (rsi_val >= BULL_RSI)
@@ -284,9 +283,9 @@ def evaluate_realtime_setup(smart_api, auth_token, stock):
     stop_loss = round(curr["low"], 2) if is_bullish else round(curr["high"], 2)
     risk = abs(curr["close"] - stop_loss)
     target = (
-        round(curr["close"] + (risk * 2), 2)
+        round(curr["close"] + (risk * 2.0), 2)
         if is_bullish
-        else round(curr["close"] - (risk * 2), 2)
+        else round(curr["close"] - (risk * 2.0), 2)
     )
 
     status_data = {
@@ -312,7 +311,7 @@ def evaluate_realtime_setup(smart_api, auth_token, stock):
 
 
 # ==========================================
-# 7. MAIN PIPELINE (FAST MULTI-THREADED EXECUTION)
+# 7. MAIN PIPELINE
 # ==========================================
 def main():
     if not is_market_open():
@@ -331,7 +330,6 @@ def main():
     print(f">>> SCANNING {len(fno_universe)} STOCKS WITH MULTI-THREADING (10 WORKERS)...")
     matches = []
 
-    # Parallel Execution for Speed Optimization
     with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         futures = [
             executor.submit(evaluate_realtime_setup, smart_api, auth_token, stock)
@@ -352,7 +350,6 @@ def main():
         df_match = pd.DataFrame(matches)
         print(df_match.to_string(index=False))
 
-        # Send Telegram Alerts
         for item in matches:
             tg_msg = (
                 f"🎯 <b>STRICT HIGH CONVICTION OPTION TRADE</b>\n\n"
@@ -365,6 +362,7 @@ def main():
             send_telegram_alert(tg_msg)
     else:
         print(">>> ZERO STOCKS MATCHED STRICT REAL-TIME BREAKOUT & 200 EMA FILTERS.")
+        send_telegram_alert("📊 <b>Scanner Summary:</b> Execution completed. No stocks matched current strict options setup filters.", bypass_time_check=True)
     print("=" * 95 + "\n")
 
 
