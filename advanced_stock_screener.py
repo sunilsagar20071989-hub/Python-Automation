@@ -4,6 +4,7 @@ import time
 from dotenv import load_dotenv
 import pandas as pd
 import pyotp
+import pytz  # Corrected: Added missing pytz import
 import requests
 import ta
 from SmartApi import SmartConnect
@@ -66,9 +67,13 @@ def fetch_dynamic_fno_universe():
 
         fno_list = []
         for _, row in nse_eq_df.iterrows():
-            fno_list.append({"symbol": row["symbol"], "token": str(row["token"])})
+            fno_list.append(
+                {"symbol": row["symbol"], "token": str(row["token"])}
+            )
 
-        print(f">>> Successfully loaded {len(fno_list)} F&O stocks dynamically!\n")
+        print(
+            f">>> Successfully loaded {len(fno_list)} F&O stocks dynamically!\n"
+        )
         return fno_list
 
     except Exception as e:
@@ -77,22 +82,42 @@ def fetch_dynamic_fno_universe():
 
 
 # ==========================================
-# 4. TELEGRAM NOTIFIER
+# 4. TELEGRAM NOTIFICATION ENGINE
 # ==========================================
-def send_telegram_message(message_text):
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print(">>> Telegram Credentials Missing in .env")
+def send_telegram_alert(message, max_retries=3):
+    """Sends HTML formatted Telegram notifications safely with Time-Filter"""
+
+    # --- Market Hours Time Check (3:15 PM IST Cutoff) ---
+    IST = pytz.timezone("Asia/Kolkata")
+    current_time = datetime.now(IST).time()
+    cutoff_time = dtime(15, 15)  # 3:15 PM Cutoff
+
+    # अगर समय शाम 3:15 बजे के बाद का है, तो मैसेज नहीं भेजा जाएगा
+    if current_time > cutoff_time:
+        print(
+            f"Alert Skipped: Current IST time ({current_time.strftime('%H:%M')}) is past market cutoff (15:15)."
+        )
         return
+
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
-        "text": message_text,
+        "text": message,
         "parse_mode": "HTML",
     }
-    try:
-        requests.post(url, json=payload, timeout=5)
-    except Exception as e:
-        print(">>> Telegram Notification Failed:", e)
+
+    for attempt in range(max_retries):
+        try:
+            response = requests.post(url, data=payload, timeout=5)
+            if response.status_code == 200:
+                return
+        except requests.exceptions.RequestException as e:
+            if attempt == max_retries - 1:
+                print(f"Telegram Alert Error: {e}")  # Corrected logger to print
+            time.sleep(1)
 
 
 # ==========================================
@@ -111,7 +136,9 @@ def initialize_smartapi():
             missing_vars.append("SMARTAPI_TOTP_SECRET")
 
         if missing_vars:
-            print(f">>> Error: Missing environment variables in .env: {', '.join(missing_vars)}")
+            print(
+                f">>> Error: Missing environment variables in .env: {', '.join(missing_vars)}"
+            )
             return None
 
         smart_api = SmartConnect(api_key=API_KEY)
@@ -203,8 +230,12 @@ def scan_fno_universe(auth_token, fno_stock_list):
         symbol = stock["symbol"]
         token = stock["token"]
 
-        df = fetch_candle_data_direct(auth_token, token, interval=TIMEFRAME, days=7)
-        if df is None or len(df) < 200:  # Need 200 bars for accurate 200 EMA
+        df = fetch_candle_data_direct(
+            auth_token, token, interval=TIMEFRAME, days=7
+        )
+        if (
+            df is None or len(df) < 200
+        ):  # Need at least 200 bars for accurate 200 EMA
             continue
 
         # Compute Indicators
@@ -224,13 +255,19 @@ def scan_fno_universe(auth_token, fno_stock_list):
         day_change_pct = ((curr["close"] - prev_close) / prev_close) * 100
 
         # STRICT 200 EMA & MOMENTUM RULES
-        ema_200_pass = curr["close"] > curr["ema_200"]  # Strict 200 EMA Rule
+        ema_200_pass = curr["close"] > curr["ema_200"]
         rsi_pass = curr["rsi"] >= MIN_RSI
         roc_pass = curr["roc"] > MIN_ROC
         vol_pass = vol_ratio >= MIN_VOL_SURGE_RATIO
         ema_cross_pass = curr["ema_9"] > curr["ema_21"]
 
-        if ema_200_pass and rsi_pass and roc_pass and vol_pass and ema_cross_pass:
+        if (
+            ema_200_pass
+            and rsi_pass
+            and roc_pass
+            and vol_pass
+            and ema_cross_pass
+        ):
             match_data = {
                 "Symbol": symbol,
                 "LTP": round(curr["close"], 2),
@@ -276,14 +313,20 @@ def main():
         print("=" * 80)
         print(df_match.to_string(index=False))
 
-        formatted_str = df_match[
-            ["Symbol", "LTP", "Change%", "RSI(14)", "VolRatio"]
-        ].to_string(index=False)
-        msg = (
-            "<b>🚀 HIGH CONVICTION BREAKOUT CANDIDATES</b>\n<pre>"
-            f"{formatted_str}</pre>"
-        )
-        send_telegram_message(msg)
+        # Telegram Message Formatting (Individual stock alerts for clean view)
+        for item in qualified_matches:
+            tg_msg = (
+                f"🚀 <b>HIGH CONVICTION BREAKOUT DETECTED</b>\n\n"
+                f"<b>Symbol:</b> {item['Symbol']}\n"
+                f"<b>LTP:</b> ₹{item['LTP']}\n"
+                f"<b>Change:</b> {item['Change%']}%\n"
+                f"<b>RSI (14):</b> {item['RSI(14)']}\n"
+                f"<b>Volume Surge:</b> {item['VolRatio']}x\n"
+                f"<b>Signal:</b> {item['Signal']}"
+            )
+            send_telegram_alert(
+                tg_msg
+            )  # Corrected function call: send_telegram_alert
     else:
         print(
             "\n>>> ZERO STOCKS MATCHED STRICT 200 EMA + RSI (>60) + VOL SURGE"
