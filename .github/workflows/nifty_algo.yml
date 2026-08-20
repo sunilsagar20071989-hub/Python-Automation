@@ -23,6 +23,11 @@ jobs:
           python -m pip install --upgrade pip
           pip install smartapi-python pandas ta pytz requests python-dotenv pyotp
 
+      - name: Check Directory Files
+        run: |
+          echo "=== List of files in repository ==="
+          ls -R
+
       - name: Execute Algo Script
         env:
           SMARTAPI_API_KEY: ${{ secrets.SMARTAPI_API_KEY }}
