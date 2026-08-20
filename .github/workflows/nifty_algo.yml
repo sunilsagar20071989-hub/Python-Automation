@@ -1,9 +1,9 @@
 name: Run Nifty Algo
 
 on:
-  workflow_dispatch:
+  workflow_dispatch: # Manual trigger
   schedule:
-    - cron: '40 3 * * 1-5'
+    - cron: '40 3 * * 1-5' # Runs at 09:10 AM IST (Mon-Fri)
 
 jobs:
   run-algo:
@@ -21,7 +21,7 @@ jobs:
       - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install smartapi-python pandas ta pytz requests python-dotenv pyotp
+          pip install smartapi-python pandas ta pytz requests python-dotenv pyotp logzero
 
       - name: Execute Algo Script
         env:
@@ -31,8 +31,4 @@ jobs:
           SMARTAPI_TOTP_SECRET: ${{ secrets.SMARTAPI_TOTP_SECRET }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: |
-          # Dhoondho aur run karo (wildcard search)
-          SCRIPT_FILE=$(find . -maxdepth 2 -name "*.py" ! -name "test*.py" | head -n 1)
-          echo "Executing Script: $SCRIPT_FILE"
-          python "$SCRIPT_FILE"
+        run: python intraday_screener.py
