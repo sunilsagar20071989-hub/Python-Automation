@@ -6,15 +6,17 @@ import sys
 import threading
 import time
 
-# Safe Import for python-dotenv (Fixes ModuleNotFoundError on GitHub Actions)
+# Safe Import for python-dotenv
 try:
     from dotenv import load_dotenv
+
     load_dotenv()
 except ImportError:
-    pass  # In GitHub Actions, secrets/env variables are provided directly by runner environment
+    pass
 
 import pandas as pd
 import pyotp
+import pytz  # Added missing import
 import requests
 import ta
 from SmartApi import SmartConnect
@@ -30,15 +32,34 @@ logger = logging.getLogger("NiftyAlgo")
 # ==========================================
 # 1. SECURE CREDENTIALS & RISK PARAMETERS
 # ==========================================
-API_KEY = os.getenv("SMARTAPI_API_KEY") or os.getenv("SMARTAPI_KEY") or os.getenv("API_KEY")
-CLIENT_CODE = os.getenv("SMARTAPI_CLIENT_CODE") or os.getenv("CLIENT_CODE") or os.getenv("CLIENT_ID")
+API_KEY = (
+    os.getenv("SMARTAPI_API_KEY")
+    or os.getenv("SMARTAPI_KEY")
+    or os.getenv("API_KEY")
+)
+CLIENT_CODE = (
+    os.getenv("SMARTAPI_CLIENT_CODE")
+    or os.getenv("CLIENT_CODE")
+    or os.getenv("CLIENT_ID")
+)
 PIN = os.getenv("SMARTAPI_PIN") or os.getenv("PIN")
 TOTP_SECRET = os.getenv("SMARTAPI_TOTP_SECRET") or os.getenv("TOTP_SECRET")
 
-if not API_KEY: missing_vars.append("SMARTAPI_API_KEY")
-if not CLIENT_CODE: missing_vars.append("SMARTAPI_CLIENT_CODE")
-if not PIN: missing_vars.append("SMARTAPI_PIN")
-if not TOTP_SECRET: missing_vars.append("SMARTAPI_TOTP_SECRET")
+# Fixed: Environment variables validation logic
+missing_vars = []
+if not API_KEY:
+    missing_vars.append("SMARTAPI_API_KEY")
+if not CLIENT_CODE:
+    missing_vars.append("SMARTAPI_CLIENT_CODE")
+if not PIN:
+    missing_vars.append("SMARTAPI_PIN")
+if not TOTP_SECRET:
+    missing_vars.append("SMARTAPI_TOTP_SECRET")
+
+if missing_vars:
+    logger.error(
+        f"Missing required environment variables: {', '.join(missing_vars)}"
+    )
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
@@ -92,7 +113,19 @@ LOG_FILE = "trade_log.csv"
 # 2. TELEGRAM NOTIFICATION & LOGGING ENGINE
 # ==========================================
 def send_telegram_alert(message, max_retries=3):
-    """Sends HTML formatted Telegram notifications safely"""
+    """Sends HTML formatted Telegram notifications safely with Time-Filter"""
+
+    # --- Market Hours Time Check (3:15 PM IST Cutoff) ---
+    IST = pytz.timezone("Asia/Kolkata")
+    current_time = datetime.now(IST).time()  # Fixed datetime call
+    cutoff_time = dtime(15, 15)  # Fixed dtime call
+
+    if current_time > cutoff_time:
+        logger.info(
+            f"Alert Skipped: Current IST time ({current_time.strftime('%H:%M')}) is past market cutoff (15:15)."
+        )
+        return
+
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
 
