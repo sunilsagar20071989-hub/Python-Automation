@@ -17,7 +17,7 @@ import requests
 import ta
 from SmartApi import SmartConnect
 
-# Logging Setup
+# LOGGING CONFIGURATION
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
 )
@@ -57,10 +57,10 @@ MIN_DAILY_RSI = 60.0
 MIN_DAILY_ROC = 1.0
 REQUIRE_VOL_SURGE = True
 MIN_WEEKLY_RSI = 55.0
-ENABLE_200_EMA_FILTER = True  # Strict institutional trend filter
+ENABLE_200_EMA_FILTER = True  # Institutional trend filter
 
 # LIVE MONITORING CONFIG
-MAX_WORKERS = 2  # Rate limit compliant for Angel One (Strict 3 req/sec limit)
+MAX_WORKERS = 2  # Strict 3 req/sec rate limit compliance
 MASTER_FILE_LOCAL = "OpenAPIScripMaster.json"
 
 LOG_FILE = "fno_scan_log.csv"
@@ -69,13 +69,13 @@ http_session = requests.Session()
 alerted_stocks_today = set()
 alert_lock = threading.Lock()
 last_alert_reset_date = dt.now(IST).date()
-cached_fno_universe = None  # Cache universe in memory to reduce I/O
+cached_fno_universe = None
 
 
 # ==========================================
 # TELEGRAM NOTIFICATION ENGINE
 # ==========================================
-def send_telegram_alert(message, max_retries=3):
+def send_telegram_alert(message, bypass_time_check=False, max_retries=3):
     """Sends HTML formatted Telegram notifications safely"""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
@@ -240,19 +240,20 @@ def analyze_stock_multi_tf(stock, auth_token):
     symbol = stock["symbol"]
     token = stock["token"]
 
-    # Rate Limiter Sleep (Ensures strict compliance with API limits)
-    time.sleep(0.4)
+    time.sleep(0.4)  # Rate limiting compliance sleep
 
     # 1. Fetch Daily Data
     df_daily = fetch_candle_data_direct(auth_token, token, "ONE_DAY", days=300)
-    if df_daily is None or len(df_daily) < 200:
+    if df_daily is None or len(df_daily) < 30:
         return None, None
+
+    ema_200_window = 200 if len(df_daily) >= 200 else len(df_daily) - 1
 
     df_daily["rsi"] = ta.momentum.rsi(df_daily["close"], window=14)
     df_daily["roc"] = ta.momentum.roc(df_daily["close"], window=12)
     df_daily["ema_9"] = ta.trend.ema_indicator(df_daily["close"], window=9)
     df_daily["ema_21"] = ta.trend.ema_indicator(df_daily["close"], window=21)
-    df_daily["ema_200"] = ta.trend.ema_indicator(df_daily["close"], window=200)
+    df_daily["ema_200"] = ta.trend.ema_indicator(df_daily["close"], window=ema_200_window)
     df_daily["vol_sma20"] = df_daily["volume"].rolling(window=20).mean()
 
     curr_d = df_daily.iloc[-1]
@@ -261,14 +262,16 @@ def analyze_stock_multi_tf(stock, auth_token):
 
     entry_p = round(curr_d["close"], 2)
 
+    vol_sma_val = curr_d["vol_sma20"] if pd.notna(curr_d["vol_sma20"]) and curr_d["vol_sma20"] > 0 else 1.0
+
     daily_rsi_pass = curr_d["rsi"] >= MIN_DAILY_RSI
     daily_roc_pass = curr_d["roc"] >= MIN_DAILY_ROC
     daily_ema_pass = curr_d["ema_9"] > curr_d["ema_21"]
     ema_200_pass = (
-        curr_d["close"] > curr_d["ema_200"] if ENABLE_200_EMA_FILTER else True
+        curr_d["close"] > curr_d["ema_200"] if (ENABLE_200_EMA_FILTER and pd.notna(curr_d["ema_200"])) else True
     )
     vol_pass = (
-        curr_d["volume"] >= curr_d["vol_sma20"] if REQUIRE_VOL_SURGE else True
+        curr_d["volume"] >= vol_sma_val if REQUIRE_VOL_SURGE else True
     )
 
     if not (
@@ -358,20 +361,25 @@ def run_live_scanner():
             for stock in fno_universe
         ]
         for future in as_completed(futures):
-            _, match_data = future.result()
-            if match_data:
-                qualified_matches.append(match_data)
+            try:
+                _, match_data = future.result()
+                if match_data:
+                    qualified_matches.append(match_data)
+            except Exception:
+                continue
 
     if qualified_matches:
         df_match = pd.DataFrame(qualified_matches)
         print("\n" + "=" * 80)
-        print("                 🔥 ACTIVE DUAL-TIMEFRAME MATCHES 🔥")
+        print("                  🔥 ACTIVE DUAL-TIMEFRAME MATCHES 🔥")
         print("=" * 80)
         print(df_match.to_string(index=False))
         print("=" * 80 + "\n")
+    else:
+        logger.info("Scan finished: Zero stocks matched dual timeframe momentum setup.")
+        send_telegram_alert("📊 <b>Dual-TF Scanner Report:</b> Completed scan. No stock qualified strict Multi-Timeframe rules currently.", bypass_time_check=True)
 
 
-# SINGLE EXECUTION TRIGGER FOR CRON / LIVE LOOPS
 if __name__ == "__main__":
     now = dt.now(IST)
     market_start = dtime(9, 15)
