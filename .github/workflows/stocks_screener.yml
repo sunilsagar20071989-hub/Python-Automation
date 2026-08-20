@@ -2,8 +2,9 @@ name: Stocks Hourly Screener Workflow
 
 on:
   schedule:
-    # Runs at 09:15 AM IST (03:45 UTC) and then hourly at :15 mins from 09:45 AM to 02:45 PM IST (04:15 UTC to 09:15 UTC)
-    - cron: '45 3,15 4-9 * * 1-5'
+    # 03:45 UTC = 09:15 AM IST
+    # 04:15-09:15 UTC (every hour at :15) = 09:45 AM to 02:45 PM IST
+    - cron: '45 3,4-9 * * 1-5'
   workflow_dispatch: # Manual trigger button
 
 concurrency:
