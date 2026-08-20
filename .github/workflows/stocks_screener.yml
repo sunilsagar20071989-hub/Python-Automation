@@ -3,7 +3,7 @@ name: Stocks Hourly Screener Workflow
 on:
   schedule:
     # Runs at 09:15 AM IST (03:45 UTC) and then hourly at :15 mins from 09:45 AM to 02:45 PM IST (04:15 UTC to 09:15 UTC)
-    - cron: '45 3, 15 4-9 * * 1-5'
+    - cron: '45 3,15 4-9 * * 1-5'
   workflow_dispatch: # Manual trigger button
 
 concurrency:
@@ -23,7 +23,6 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
-          cache: 'pip'
 
       - name: Install Dependencies
         run: |
