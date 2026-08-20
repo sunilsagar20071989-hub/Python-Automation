@@ -494,20 +494,21 @@ def main():
     global pos_active, active_symbol, active_token, entry_price, sl_price, tgt_price, highest_price_seen, active_quantity, trade_entry_time, daily_trades_count
 
     initialize_smartapi()
-    logger.info("⚡ Nifty Automated Algo Engine Started Successfully!")
 
+    # Non-market hours check: Immediately exit cleanly to achieve GREEN status on GitHub
+    if not is_market_open():
+        logger.info("Market Closed. Terminating execution cleanly.")
+        send_telegram_alert("ℹ️ <b>Nifty Algo:</b> Market Closed. Workflow finished successfully.")
+        sys.exit(0)
+
+    logger.info("⚡ Nifty Automated Algo Engine Started Successfully!")
     send_telegram_alert(
         "🚀 <b>Nifty Option Algo Active!</b>\n"
         "Engine listening for signals..."
     )
 
-    while True:
+    while is_market_open():
         try:
-            if not is_market_open():
-                logger.info("⏸️ Market Closed. Waiting...")
-                time.sleep(10)
-                continue
-
             if pos_active:
                 monitor_active_position()
             else:
@@ -546,10 +547,31 @@ def main():
             logger.error(f"Main Loop Exception: {e}")
             time.sleep(5)
 
+    logger.info("Market hours ended. Exiting engine cleanly.")
+    sys.exit(0)
+
 
 if __name__ == "__main__":
     main()
 
+import os
+import sys
+import time
+import json
+import logging
+from datetime import datetime, time as dtime
+import pytz
+import requests
+import pyotp
+import pandas as pd
+import ta
+from SmartApi import SmartConnect
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 
 # ==========================================
 # LOGGING CONFIGURATION
@@ -647,6 +669,10 @@ def is_squareoff_time():
 
 
 def send_telegram_alert(message, max_retries=3):
+    current_time = get_ist_now().time()
+    if current_time > dtime(15, 15):
+        return
+
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
 
@@ -711,15 +737,26 @@ def initialize_smartapi():
         feed_token = smartApi.getfeedToken()
         logger.info("SmartAPI Login Successful.")
 
-        scrip_url = "https://margincalculator.angelone.in/OpenAPI_File/files/OpenAPIScripMaster.json"
-        res = requests.get(
-            scrip_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=25
-        )
-        if res.status_code == 200:
-            scrip_master_df = pd.DataFrame(res.json())
-            if "token" in scrip_master_df.columns:
-                scrip_master_df["token"] = scrip_master_df["token"].astype(str)
-            logger.info("Scrip Master Loaded successfully.")
+        urls = [
+            "https://margincalculator.angelone.in/OpenAPI_File/files/OpenAPIScripMaster.json",
+            "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json",
+        ]
+        headers = {"User-Agent": "Mozilla/5.0"}
+
+        for scrip_url in urls:
+            try:
+                res = requests.get(scrip_url, headers=headers, timeout=25)
+                if res.status_code == 200:
+                    scrip_master_df = pd.DataFrame(res.json())
+                    if "token" in scrip_master_df.columns:
+                        scrip_master_df["token"] = scrip_master_df["token"].astype(str)
+                    if "symbol" in scrip_master_df.columns:
+                        scrip_master_df["symbol"] = scrip_master_df["symbol"].astype(str)
+                    logger.info("Scrip Master Loaded successfully.")
+                    break
+            except Exception:
+                continue
+
     except Exception as e:
         logger.critical(f"Initialization Exception: {e}")
         sys.exit(1)
@@ -808,6 +845,9 @@ def get_india_vix():
 
 def get_itm_option_scrip(spot_price, option_type="CE"):
     try:
+        if scrip_master_df is None or scrip_master_df.empty:
+            return None, None
+
         atm_strike = round(spot_price / 50.0) * 50
         itm_strike = (
             atm_strike - ITM_STRIKE_OFFSET
@@ -957,7 +997,7 @@ def run_trading_cycle():
         place_order(active_symbol, active_token, "SELL", active_quantity)
         log_trade(
             active_symbol,
-            "BUY",
+            "SELL",
             entry_price,
             ltp,
             active_quantity,
@@ -997,7 +1037,7 @@ def run_trading_cycle():
             place_order(active_symbol, active_token, "SELL", active_quantity)
             log_trade(
                 active_symbol,
-                "BUY",
+                "SELL",
                 entry_price,
                 ltp,
                 active_quantity,
@@ -1018,7 +1058,7 @@ def run_trading_cycle():
             place_order(active_symbol, active_token, "SELL", active_quantity)
             log_trade(
                 active_symbol,
-                "BUY",
+                "SELL",
                 entry_price,
                 ltp,
                 active_quantity,
@@ -1039,7 +1079,7 @@ def run_trading_cycle():
             place_order(active_symbol, active_token, "SELL", active_quantity)
             log_trade(
                 active_symbol,
-                "BUY",
+                "SELL",
                 entry_price,
                 ltp,
                 active_quantity,
@@ -1150,3 +1190,4 @@ if __name__ == "__main__":
             time.sleep(2)
 
     logger.info("Market hours finished. Stopping engine.")
+    sys.exit(0)
