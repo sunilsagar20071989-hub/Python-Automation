@@ -24,31 +24,29 @@ TOTP_SECRET = os.getenv("SMARTAPI_TOTP_SECRET")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-# STRATEGY THRESHOLDS (Strict Momentum & 200 EMA Criteria)
+# STRATEGY THRESHOLDS
 MIN_RSI = 60.0        # System standard RSI >= 60
 MIN_ROC = 0.0         # ROC must be > 0
-MIN_VOL_SURGE_RATIO = 1.5  # Volume >= 1.5x of 21-period SMA Volume
+MIN_VOL_SURGE_RATIO = 1.2  # Volume >= 1.2x of 21-period SMA Volume
 TIMEFRAME = "FIVE_MINUTE"  # Live Intraday Scanning (5-Min Candles)
 MAX_WORKERS = 10      # Multi-threading for high-speed scanning
 
 
 # ==========================================
-# 2. MARKET HOURS CHECK (IST TIMEZONE FIX)
+# 2. MARKET HOURS CHECK
 # ==========================================
 def is_market_open():
-    """Ensures alerts are sent only during live trading hours (09:15 to 15:25 IST)."""
+    """Ensures alerts are sent during trading hours (09:15 to 15:25 IST)."""
     IST = pytz.timezone("Asia/Kolkata")
     now = datetime.now(IST).time()
-    market_start = dtime(9, 15)
-    market_end = dtime(15, 25)
-    return market_start <= now <= market_end
+    return dtime(9, 15) <= now <= dtime(15, 25)
 
 
 # ==========================================
 # 3. DYNAMIC F&O UNIVERSE FETCH
 # ==========================================
 def fetch_dynamic_fno_universe():
-    print(">>> Downloading Angel One Master Instrument File for Dynamic F&O Universe...")
+    print(">>> Downloading Angel One Master Instrument File...")
     urls = [
         "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json",
         "https://margincalculator.angelone.in/OpenAPI_File/files/OpenAPIScripMaster.json",
@@ -87,14 +85,13 @@ def fetch_dynamic_fno_universe():
 # ==========================================
 # 4. TELEGRAM NOTIFICATION ENGINE
 # ==========================================
-def send_telegram_alert(message, max_retries=3):
-    """Sends HTML formatted Telegram notifications safely with Time-Filter"""
+def send_telegram_alert(message, bypass_time_check=False, max_retries=3):
+    """Sends HTML formatted Telegram notifications."""
     IST = pytz.timezone("Asia/Kolkata")
     current_time = datetime.now(IST).time()
-    cutoff_time = dtime(15, 15)
 
-    if current_time > cutoff_time:
-        print(f"Alert Skipped: Current IST time ({current_time.strftime('%H:%M')}) is past market cutoff (15:15).")
+    if not bypass_time_check and current_time > dtime(15, 30):
+        print(f"Alert Skipped: Current IST time ({current_time.strftime('%H:%M')}) is past market cutoff.")
         return
 
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
@@ -123,18 +120,8 @@ def send_telegram_alert(message, max_retries=3):
 # ==========================================
 def initialize_smartapi():
     try:
-        missing_vars = []
-        if not API_KEY:
-            missing_vars.append("SMARTAPI_KEY/SMARTAPI_API_KEY")
-        if not CLIENT_CODE:
-            missing_vars.append("SMARTAPI_CLIENT_CODE")
-        if not PIN:
-            missing_vars.append("SMARTAPI_PIN")
-        if not TOTP_SECRET:
-            missing_vars.append("SMARTAPI_TOTP_SECRET")
-
-        if missing_vars:
-            print(f">>> Error: Missing environment variables: {', '.join(missing_vars)}")
+        if not all([API_KEY, CLIENT_CODE, PIN, TOTP_SECRET]):
+            print(">>> Error: Missing environment variables.")
             return None
 
         smart_api = SmartConnect(api_key=API_KEY)
@@ -145,7 +132,7 @@ def initialize_smartapi():
             raw_token = data["data"]["jwtToken"]
             auth_token = raw_token if raw_token.startswith("Bearer ") else f"Bearer {raw_token}"
             print("\n" + "=" * 85)
-            print(">>> SmartAPI Authenticated! Strict 5-Min 200 EMA & Momentum Active...")
+            print(">>> SmartAPI Authenticated! Stock Screener Active...")
             print("=" * 85 + "\n")
             return auth_token
         else:
@@ -158,7 +145,7 @@ def initialize_smartapi():
 # ==========================================
 # 6. INTRADAY DATA FETCH & PROCESSING
 # ==========================================
-def fetch_candle_data_direct(auth_token, token, interval=TIMEFRAME, days=7, exchange="NSE"):
+def fetch_candle_data_direct(auth_token, token, interval=TIMEFRAME, days=5, exchange="NSE"):
     url = "https://apiconnect.angelone.in/rest/secure/angelbroking/historical/v1/getCandleData"
 
     headers = {
@@ -208,8 +195,8 @@ def evaluate_stock_setup(auth_token, stock):
     symbol = stock["symbol"]
     token = stock["token"]
 
-    df = fetch_candle_data_direct(auth_token, token, interval=TIMEFRAME, days=7)
-    if df is None or len(df) < 200:
+    df = fetch_candle_data_direct(auth_token, token, interval=TIMEFRAME, days=5)
+    if df is None or len(df) < 50:
         return None
 
     # Indicator Calculation
@@ -217,21 +204,22 @@ def evaluate_stock_setup(auth_token, stock):
     df["roc"] = ta.momentum.roc(df["close"], window=9)
     df["ema_9"] = ta.trend.ema_indicator(df["close"], window=9)
     df["ema_21"] = ta.trend.ema_indicator(df["close"], window=21)
-    df["ema_200"] = ta.trend.ema_indicator(df["close"], window=200)
+    df["ema_200"] = ta.trend.ema_indicator(df["close"], window=min(200, len(df) - 1))
     df["vol_sma21"] = df["volume"].rolling(window=21).mean()
 
     curr = df.iloc[-1]
-    prev_close = df.iloc[-2]["close"]
+    prev_close = df.iloc[-2]["close"] if len(df) > 1 else curr["close"]
 
-    vol_ratio = curr["volume"] / curr["vol_sma21"] if curr["vol_sma21"] > 0 else 0
+    vol_sma = curr["vol_sma21"] if pd.notna(curr["vol_sma21"]) and curr["vol_sma21"] > 0 else 1
+    vol_ratio = curr["volume"] / vol_sma
     day_change_pct = ((curr["close"] - prev_close) / prev_close) * 100
 
-    # STRICT 200 EMA & MOMENTUM RULES
-    ema_200_pass = curr["close"] > curr["ema_200"]
-    rsi_pass = curr["rsi"] >= MIN_RSI
-    roc_pass = curr["roc"] > MIN_ROC
+    # MOMENTUM & BREAKOUT RULES
+    ema_200_pass = curr["close"] > curr["ema_200"] if pd.notna(curr["ema_200"]) else True
+    rsi_pass = curr["rsi"] >= MIN_RSI if pd.notna(curr["rsi"]) else False
+    roc_pass = curr["roc"] > MIN_ROC if pd.notna(curr["roc"]) else False
     vol_pass = vol_ratio >= MIN_VOL_SURGE_RATIO
-    ema_cross_pass = curr["ema_9"] > curr["ema_21"]
+    ema_cross_pass = curr["ema_9"] > curr["ema_21"] if (pd.notna(curr["ema_9"]) and pd.notna(curr["ema_21"])) else False
 
     if ema_200_pass and rsi_pass and roc_pass and vol_pass and ema_cross_pass:
         return {
@@ -240,17 +228,17 @@ def evaluate_stock_setup(auth_token, stock):
             "Change%": round(day_change_pct, 2),
             "RSI(14)": round(curr["rsi"], 2),
             "VolRatio": round(vol_ratio, 2),
-            "Signal": "BUY CALL / LONG",
+            "Signal": "BUY / LONG BREAKOUT",
         }
     return None
 
 
 # ==========================================
-# 7. MAIN PIPELINE (FAST MULTI-THREADED SCANNER)
+# 7. MAIN PIPELINE
 # ==========================================
 def main():
     if not is_market_open():
-        print(">>> Market Closed! Skipping Execution to Avoid Post-Market False Signals.")
+        print(">>> Market Closed! Skipping Execution.")
         return
 
     auth_token = initialize_smartapi()
@@ -263,10 +251,9 @@ def main():
         print(">>> F&O Stock List fetch failed. Exiting.")
         return
 
-    print(f">>> SCANNING {len(fno_stock_list)} F&O STOCKS ON 5-MIN TIMEFRAME WITH MULTI-THREADING...")
+    print(f">>> SCANNING {len(fno_stock_list)} F&O STOCKS...")
     qualified_matches = []
 
-    # Parallel processing for 3-5 second scanning
     with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         futures = [executor.submit(evaluate_stock_setup, auth_token, stock) for stock in fno_stock_list]
         for future in concurrent.futures.as_completed(futures):
@@ -278,15 +265,15 @@ def main():
                 continue
 
     if qualified_matches:
-        df_match = pd.DataFrame(qualified_matches)
         print("\n" + "=" * 80)
         print(" 🔥 HIGH CONVICTION BREAKOUT CANDIDATES MATCHED RULES 🔥")
         print("=" * 80)
+        df_match = pd.DataFrame(qualified_matches)
         print(df_match.to_string(index=False))
 
         for item in qualified_matches:
             tg_msg = (
-                f"🚀 <b>5-MIN HIGH CONVICTION BREAKOUT</b>\n\n"
+                f"🚀 <b>STOCKS BREAKOUT ALERT</b>\n\n"
                 f"<b>Symbol:</b> {item['Symbol']}\n"
                 f"<b>LTP:</b> ₹{item['LTP']}\n"
                 f"<b>Change:</b> {item['Change%']}%\n"
@@ -296,7 +283,8 @@ def main():
             )
             send_telegram_alert(tg_msg)
     else:
-        print("\n>>> ZERO STOCKS MATCHED STRICT 200 EMA + RSI (>60) + VOL SURGE RULES.")
+        print("\n>>> ZERO STOCKS MATCHED STRICT RULES.")
+        send_telegram_alert(f"📊 <b>Stock Screener Completed:</b> Scanned {len(fno_stock_list)} stocks. No strict breakout setup matched in this interval.", bypass_time_check=False)
 
 
 if __name__ == "__main__":
