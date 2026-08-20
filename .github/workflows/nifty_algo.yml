@@ -1,9 +1,9 @@
 name: Run Nifty Algo
 
 on:
-  workflow_dispatch: # Manual trigger
+  workflow_dispatch:
   schedule:
-    - cron: '40 3 * * 1-5' # Runs at 09:10 AM IST (Mon-Fri)
+    - cron: '40 3 * * 1-5'
 
 jobs:
   run-algo:
@@ -23,11 +23,6 @@ jobs:
           python -m pip install --upgrade pip
           pip install smartapi-python pandas ta pytz requests python-dotenv pyotp
 
-      - name: Check Directory Files
-        run: |
-          echo "=== List of files in repository ==="
-          ls -R
-
       - name: Execute Algo Script
         env:
           SMARTAPI_API_KEY: ${{ secrets.SMARTAPI_API_KEY }}
@@ -36,4 +31,8 @@ jobs:
           SMARTAPI_TOTP_SECRET: ${{ secrets.SMARTAPI_TOTP_SECRET }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python nifty-algo.py
+        run: |
+          # Dhoondho aur run karo (wildcard search)
+          SCRIPT_FILE=$(find . -maxdepth 2 -name "*.py" ! -name "test*.py" | head -n 1)
+          echo "Executing Script: $SCRIPT_FILE"
+          python "$SCRIPT_FILE"
