@@ -5,6 +5,7 @@ import time
 from dotenv import load_dotenv
 import pandas as pd
 import pyotp
+import pytz  # Corrected: Added missing pytz import
 import requests
 import ta
 from SmartApi import SmartConnect
@@ -58,7 +59,7 @@ def is_market_open():
 
 
 # ==========================================
-# 3. DYNAMIC F&O UNIVERSE FETCH (WITH FALLBACKS)
+# 3. DYNAMIC F&O UNIVERSE FETCH
 # ==========================================
 def fetch_dynamic_fno_universe():
     print(
@@ -116,23 +117,41 @@ def fetch_dynamic_fno_universe():
 
 
 # ==========================================
-# 4. TELEGRAM NOTIFIER FUNCTION
+# 4. TELEGRAM NOTIFICATION ENGINE
 # ==========================================
-def send_telegram_message(message_text):
+def send_telegram_alert(message, max_retries=3):
+    """Sends HTML formatted Telegram notifications safely with Time-Filter"""
+
+    # --- Market Hours Time Check (3:15 PM IST Cutoff) ---
+    IST = pytz.timezone("Asia/Kolkata")
+    current_time = datetime.now(IST).time()
+    cutoff_time = dtime(15, 15)  # 3:15 PM
+
+    if current_time > cutoff_time:
+        print(
+            f"Alert Skipped: Current IST time ({current_time.strftime('%H:%M')}) is past market cutoff (15:15)."
+        )
+        return
+
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print(">>> Telegram Token/Chat ID missing in environment.")
         return
 
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
-        "text": message_text,
+        "text": message,
         "parse_mode": "HTML",
     }
-    try:
-        requests.post(url, json=payload, timeout=5)
-    except Exception as e:
-        print(">>> Telegram Alert Error:", e)
+
+    for attempt in range(max_retries):
+        try:
+            response = requests.post(url, data=payload, timeout=5)
+            if response.status_code == 200:
+                return
+        except requests.exceptions.RequestException as e:
+            if attempt == max_retries - 1:
+                print(f"Telegram Alert Error: {e}")  # Corrected logger to print
+            time.sleep(1)
 
 
 # ==========================================
@@ -169,7 +188,7 @@ def initialize_smartapi():
 
 
 # ==========================================
-# 6. DATA FETCHING & EVALUATION (200 EMA + 15-MIN STRICT)
+# 6. DATA FETCHING & EVALUATION
 # ==========================================
 def fetch_live_15min_data(smart_api, auth_token, token):
     url = "https://apiconnect.angelone.in/rest/secure/angelbroking/historical/v1/getCandleData"
@@ -199,7 +218,6 @@ def fetch_live_15min_data(smart_api, auth_token, token):
     }
 
     try:
-        # Secondary fallback using SmartApi SDK method if direct REST HTTP fails
         resp = requests.post(url, headers=headers, json=payload, timeout=8)
         resp_json = resp.json()
 
@@ -264,7 +282,7 @@ def evaluate_realtime_setup(smart_api, auth_token, stock):
     vol_ratio = curr["volume"] / curr["vol_sma"] if curr["vol_sma"] > 0 else 0
     vol_pass = vol_ratio >= MIN_VOL_RATIO
 
-    # 1-Hour High/Low Range Breakout Check
+    # Range Breakout Check
     recent_4_high = df["high"].iloc[-5:-1].max()
     recent_4_low = df["low"].iloc[-5:-1].min()
 
@@ -361,21 +379,19 @@ def main():
         df_match = pd.DataFrame(matches)
         print(df_match.to_string(index=False))
 
-        match_text = df_match[
-            [
-                "Symbol",
-                "Live_LTP",
-                "Option_Action",
-                "VolRatio",
-                "SL_Price",
-                "Target_Price",
-            ]
-        ].to_string(index=False)
-        telegram_msg_match = (
-            "<b>🎯 STRICT HIGH CONVICTION OPTION TRADES FOUND</b>\n<pre>"
-            f"{match_text}</pre>"
-        )
-        send_telegram_message(telegram_msg_match)
+        # Telegram Message Formatting Fix (Clean List Format)
+        for item in matches:
+            tg_msg = (
+                f"🎯 <b>STRICT HIGH CONVICTION OPTION TRADE</b>\n\n"
+                f"<b>Stock:</b> {item['Symbol']}\n"
+                f"<b>Action:</b> {item['Option_Action']}\n"
+                f"<b>LTP:</b> ₹{item['Live_LTP']}\n"
+                f"<b>Vol Ratio:</b> {item['VolRatio']}x\n"
+                f"<b>SL:</b> ₹{item['SL_Price']} | <b>Target (1:2):</b> ₹{item['Target_Price']}"
+            )
+            send_telegram_alert(
+                tg_msg
+            )  # Corrected function call: send_telegram_alert
     else:
         print(
             ">>> ZERO STOCKS MATCHED STRICT REAL-TIME BREAKOUT & 200 EMA FILTERS."
