@@ -1,3 +1,4 @@
+import concurrent.futures
 from datetime import datetime, time as dtime, timedelta
 import os
 import sys
@@ -5,7 +6,7 @@ import time
 from dotenv import load_dotenv
 import pandas as pd
 import pyotp
-import pytz  # Corrected: Added missing pytz import
+import pytz
 import requests
 import ta
 from SmartApi import SmartConnect
@@ -35,24 +36,24 @@ if not TOTP_SECRET:
     missing_vars.append("SMARTAPI_TOTP_SECRET")
 
 if missing_vars:
-    print(
-        f"❌ Error: Missing environment credentials: {', '.join(missing_vars)}"
-    )
+    print(f"❌ Error: Missing environment credentials: {', '.join(missing_vars)}")
     sys.exit(1)
 
 # STRICT INTRADAY PARAMETERS
-BULL_RSI = 60.0  # Call Option Trigger
-BEAR_RSI = 40.0  # Put Option Trigger
-MIN_VOL_RATIO = 1.5  # Current 15-min volume >= 1.5x of last 20 candles avg
-MAX_GAP_PCT = 1.2  # Avoid high gap-up/gap-down stocks
+BULL_RSI = 60.0       # Call Option Trigger
+BEAR_RSI = 40.0       # Put Option Trigger
+MIN_VOL_RATIO = 1.5   # Current 15-min volume >= 1.5x of last 20 candles avg
+MAX_GAP_PCT = 1.2     # Avoid high gap-up/gap-down stocks
+MAX_WORKERS = 10      # Fast Multi-threading limit for Angel One API
 
 
 # ==========================================
-# 2. MARKET HOURS FILTER
+# 2. MARKET HOURS FILTER (IST TIMEZONE FIX)
 # ==========================================
 def is_market_open():
     """Restricts signals strictly between 09:15 AM to 03:25 PM IST."""
-    now = datetime.now().time()
+    IST = pytz.timezone("Asia/Kolkata")
+    now = datetime.now(IST).time()
     market_start = dtime(9, 15)
     market_end = dtime(15, 25)
     return market_start <= now <= market_end
@@ -62,10 +63,7 @@ def is_market_open():
 # 3. DYNAMIC F&O UNIVERSE FETCH
 # ==========================================
 def fetch_dynamic_fno_universe():
-    print(
-        ">>> Downloading Angel One Master Instrument File for Dynamic F&O"
-        " Universe..."
-    )
+    print(">>> Downloading Angel One Master Instrument File for Dynamic F&O Universe...")
     urls = [
         "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json",
         "https://margincalculator.angelone.in/OpenAPI_File/files/OpenAPIScripMaster.json",
@@ -97,17 +95,12 @@ def fetch_dynamic_fno_universe():
 
                 fno_list = []
                 for _, row in nse_eq_df.iterrows():
-                    fno_list.append(
-                        {
-                            "symbol": str(row[sym_col]),
-                            "token": str(row[token_col]),
-                        }
-                    )
+                    fno_list.append({
+                        "symbol": str(row[sym_col]),
+                        "token": str(row[token_col]),
+                    })
 
-                print(
-                    f">>> Successfully loaded {len(fno_list)} F&O stocks"
-                    " dynamically!\n"
-                )
+                print(f">>> Successfully loaded {len(fno_list)} F&O stocks dynamically!\n")
                 return fno_list
         except Exception:
             continue
@@ -121,16 +114,12 @@ def fetch_dynamic_fno_universe():
 # ==========================================
 def send_telegram_alert(message, max_retries=3):
     """Sends HTML formatted Telegram notifications safely with Time-Filter"""
-
-    # --- Market Hours Time Check (3:15 PM IST Cutoff) ---
     IST = pytz.timezone("Asia/Kolkata")
     current_time = datetime.now(IST).time()
-    cutoff_time = dtime(15, 15)  # 3:15 PM
+    cutoff_time = dtime(15, 15)
 
     if current_time > cutoff_time:
-        print(
-            f"Alert Skipped: Current IST time ({current_time.strftime('%H:%M')}) is past market cutoff (15:15)."
-        )
+        print(f"Alert Skipped: Current IST time ({current_time.strftime('%H:%M')}) is past market cutoff (15:15).")
         return
 
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
@@ -150,7 +139,7 @@ def send_telegram_alert(message, max_retries=3):
                 return
         except requests.exceptions.RequestException as e:
             if attempt == max_retries - 1:
-                print(f"Telegram Alert Error: {e}")  # Corrected logger to print
+                print(f"Telegram Alert Error: {e}")
             time.sleep(1)
 
 
@@ -165,23 +154,13 @@ def initialize_smartapi():
 
         if data and data.get("status"):
             raw_token = data["data"]["jwtToken"]
-            auth_token = (
-                raw_token
-                if raw_token.startswith("Bearer ")
-                else f"Bearer {raw_token}"
-            )
+            auth_token = raw_token if raw_token.startswith("Bearer ") else f"Bearer {raw_token}"
             print("\n" + "=" * 95)
-            print(
-                ">>> SmartAPI Connected! Dynamic 15-Min 200 EMA High-Conviction"
-                " Scanner Active..."
-            )
+            print(">>> SmartAPI Connected! Dynamic 15-Min 200 EMA High-Conviction Scanner Active...")
             print("=" * 95 + "\n")
             return smart_api, auth_token
         else:
-            print(
-                "❌ Login Failed:",
-                data.get("message") if data else "No response",
-            )
+            print("❌ Login Failed:", data.get("message") if data else "No response")
     except Exception as e:
         print(">>> Authentication Exception:", e)
     return None, None
@@ -221,19 +200,11 @@ def fetch_live_15min_data(smart_api, auth_token, token):
         resp = requests.post(url, headers=headers, json=payload, timeout=8)
         resp_json = resp.json()
 
-        if (
-            resp_json.get("status")
-            and resp_json.get("data")
-            and len(resp_json["data"]) > 0
-        ):
+        if resp_json.get("status") and resp_json.get("data") and len(resp_json["data"]) > 0:
             candle_data = resp_json["data"]
         else:
             sdk_resp = smart_api.getCandleData(payload)
-            candle_data = (
-                sdk_resp.get("data", [])
-                if sdk_resp and sdk_resp.get("status")
-                else []
-            )
+            candle_data = sdk_resp.get("data", []) if sdk_resp and sdk_resp.get("status") else []
 
         if candle_data:
             df = pd.DataFrame(
@@ -341,14 +312,11 @@ def evaluate_realtime_setup(smart_api, auth_token, stock):
 
 
 # ==========================================
-# 7. MAIN PIPELINE
+# 7. MAIN PIPELINE (FAST MULTI-THREADED EXECUTION)
 # ==========================================
 def main():
     if not is_market_open():
-        print(
-            ">>> Market Closed! Execution blocked to prevent late post-market"
-            " signals."
-        )
+        print(">>> Market Closed! Execution blocked to prevent late post-market signals.")
         return
 
     smart_api, auth_token = initialize_smartapi()
@@ -360,17 +328,22 @@ def main():
         print(">>> F&O Universe loading failed. Exiting.")
         return
 
-    print(
-        f">>> SCANNING {len(fno_universe)} STOCKS FOR STRICT 200 EMA + 15-MIN"
-        " OPTION TRADES...\n"
-    )
+    print(f">>> SCANNING {len(fno_universe)} STOCKS WITH MULTI-THREADING (10 WORKERS)...")
     matches = []
 
-    for stock in fno_universe:
-        _, match = evaluate_realtime_setup(smart_api, auth_token, stock)
-        if match:
-            matches.append(match)
-        time.sleep(0.08)
+    # Parallel Execution for Speed Optimization
+    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = [
+            executor.submit(evaluate_realtime_setup, smart_api, auth_token, stock)
+            for stock in fno_universe
+        ]
+        for future in concurrent.futures.as_completed(futures):
+            try:
+                _, match = future.result()
+                if match:
+                    matches.append(match)
+            except Exception:
+                continue
 
     print("\n" + "=" * 95)
     print("  🎯 LIVE HIGH CONVICTION OPTION TRADES (200 EMA FILTERED) 🎯")
@@ -379,7 +352,7 @@ def main():
         df_match = pd.DataFrame(matches)
         print(df_match.to_string(index=False))
 
-        # Telegram Message Formatting Fix (Clean List Format)
+        # Send Telegram Alerts
         for item in matches:
             tg_msg = (
                 f"🎯 <b>STRICT HIGH CONVICTION OPTION TRADE</b>\n\n"
@@ -389,13 +362,9 @@ def main():
                 f"<b>Vol Ratio:</b> {item['VolRatio']}x\n"
                 f"<b>SL:</b> ₹{item['SL_Price']} | <b>Target (1:2):</b> ₹{item['Target_Price']}"
             )
-            send_telegram_alert(
-                tg_msg
-            )  # Corrected function call: send_telegram_alert
+            send_telegram_alert(tg_msg)
     else:
-        print(
-            ">>> ZERO STOCKS MATCHED STRICT REAL-TIME BREAKOUT & 200 EMA FILTERS."
-        )
+        print(">>> ZERO STOCKS MATCHED STRICT REAL-TIME BREAKOUT & 200 EMA FILTERS.")
     print("=" * 95 + "\n")
 
 
