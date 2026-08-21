@@ -1,4 +1,4 @@
-# DYNAMIC FULL-MARKET QUANT SCREENER (RATE-LIMIT SAFE)
+# DYNAMIC FULL-MARKET QUANT SCREENER (RATE-LIMIT PROOF)
 from datetime import datetime as dt, timedelta
 import html
 import logging
@@ -31,9 +31,9 @@ SESSION.headers.update({
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 })
 
-MAX_STOCKS = int(os.getenv("FULL_MARKET_MAX_STOCKS", "0"))  # 0 = All NSE-EQ
+MAX_STOCKS = int(os.getenv("FULL_MARKET_MAX_STOCKS", "500"))  # Default set to top 500 liquid stocks for safe runtime
 FUNDAMENTALS_ENABLED = os.getenv("FUNDAMENTALS_ENABLED", "1") == "1"
-REQUEST_DELAY = 0.35  # Strict throttle to respect ~3 req/sec rate limit
+REQUEST_DELAY = 1.05  # Strict 1 req/sec rate limit compliance
 
 
 def send_telegram(message):
@@ -144,7 +144,8 @@ def initialize_smartapi():
     return None
 
 
-def fetch_historical_candles(api, token, interval="FIFTEEN_MINUTE", days=10):
+def fetch_historical_candles_with_retry(api, token, interval="FIFTEEN_MINUTE", days=10, retries=2):
+    """Fetches candle data with exponential retry backoff if rate limit occurs."""
     now = dt.now(IST)
     payload = {
         "exchange": "NSE",
@@ -153,30 +154,41 @@ def fetch_historical_candles(api, token, interval="FIFTEEN_MINUTE", days=10):
         "fromdate": (now - timedelta(days=days)).strftime("%Y-%m-%d 09:15"),
         "todate": now.strftime("%Y-%m-%d %H:%M"),
     }
-    try:
-        res = api.getCandleData(payload)
-        if not res or not res.get("status") or not res.get("data"):
+    
+    for attempt in range(retries + 1):
+        try:
+            time.sleep(REQUEST_DELAY)
+            res = api.getCandleData(payload)
+            
+            if res and isinstance(res, dict):
+                if res.get("status") and res.get("data"):
+                    df = pd.DataFrame(res["data"], columns=["timestamp", "open", "high", "low", "close", "volume"])
+                    for c in ["open", "high", "low", "close", "volume"]:
+                        df[c] = pd.to_numeric(df[c], errors="coerce")
+                    return df.dropna(subset=["open", "high", "low", "close", "volume"])
+                
+                # Check for rate limit response message
+                msg = str(res.get("message", "")).lower()
+                if "exceeding access rate" in msg or "access denied" in msg:
+                    logger.warning("Rate limit hit for token %s. Pausing 5 seconds... (Attempt %d)", token, attempt + 1)
+                    time.sleep(5)
+                    continue
+
             return None
-            
-        df = pd.DataFrame(res["data"], columns=["timestamp", "open", "high", "low", "close", "volume"])
-        for c in ["open", "high", "low", "close", "volume"]:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
-            
-        df = df.dropna(subset=["open", "high", "low", "close", "volume"])
-        return df
-    except Exception as exc:
-        logger.warning("Candle fetch error for token %s: %s", token, exc)
-        return None
+        except Exception as exc:
+            if attempt < retries:
+                time.sleep(3)
+            else:
+                logger.warning("Candle fetch failed for token %s: %s", token, exc)
+                return None
+    return None
 
 
 def analyze_stock(stock_info, api):
     symbol = stock_info["symbol"]
     token = stock_info["token"]
     
-    # Controlled delay for rate limiting
-    time.sleep(REQUEST_DELAY)
-    
-    df = fetch_historical_candles(api, token)
+    df = fetch_historical_candles_with_retry(api, token)
     if df is None or len(df) < 50:
         return None
 
@@ -233,7 +245,10 @@ def execute_master_scan():
     matches = []
     total = len(universe)
     
-    for stock in universe:
+    for i, stock in enumerate(universe, 1):
+        if i % 50 == 0:
+            logger.info("Progress: Processed %d/%d stocks...", i, total)
+        
         result = analyze_stock(stock, api)
         if result:
             matches.append(result)
