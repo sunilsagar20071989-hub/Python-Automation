@@ -4,7 +4,7 @@ on:
   schedule:
     # Mon-Fri 9:15 AM to 3:30 PM IST
     - cron: '15,30,45,0 4-9 * * 1-5'
-  workflow_dispatch: # Manual Run Button Enable Karta Hai
+  workflow_dispatch:
 
 concurrency:
   group: smartapi-screener
@@ -17,17 +17,17 @@ jobs:
 
     steps:
       - name: Checkout Code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v4.2.2 # Node 24 compatible version
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v5.3.0 # Node 24 compatible version
         with:
           python-version: '3.11'
 
       - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install smartapi-python pandas ta beautifulsoup4 requests pyotp pytz
+          pip install smartapi-python logzero websocket-client pandas ta beautifulsoup4 requests pyotp pytz
 
       - name: Execute Screener
         env:
@@ -37,5 +37,5 @@ jobs:
           SMARTAPI_TOTP_SECRET: ${{ secrets.SMARTAPI_TOTP_SECRET }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          FULL_MARKET_MAX_STOCKS: "100"
+          FULL_MARKET_MAX_STOCKS: "200"
         run: python quant_hybrid_engine.py
