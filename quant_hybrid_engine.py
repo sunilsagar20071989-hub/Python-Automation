@@ -1,5 +1,5 @@
-# HYBRID QUANT SCREENER (ZERO RATE-LIMIT ISSUE VIA YFINANCE + SMARTAPI)
-from datetime import datetime as dt, timedelta
+# HYBRID QUANT SCREENER (LIGHTNING FAST BATCH YFINANCE)
+from datetime import datetime as dt
 import html
 import logging
 import os
@@ -8,13 +8,14 @@ import time
 from urllib.parse import quote
 
 import pandas as pd
-import pyotp
 import pytz
 import requests
 import ta
 import yfinance as yf
 from bs4 import BeautifulSoup
 
+# Suppress noisy logger outputs from yfinance
+logging.getLogger("yfinance").setLevel(logging.CRITICAL)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("FullMarketScreener")
 
@@ -46,27 +47,30 @@ def send_telegram(message):
             logger.error("Telegram error: %s", exc)
 
 
-def fetch_nse_stock_universe():
+def fetch_clean_nse_universe():
     url = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
     try:
         r = SESSION.get(url, timeout=30)
         r.raise_for_status()
         df = pd.DataFrame(r.json())
         
+        # Filter genuine equity stocks and exclude test / non-tradeable symbols
         eq = df[
             (df["exch_seg"].eq("NSE"))
             & df["symbol"].astype(str).str.endswith("-EQ")
+            & ~df["symbol"].astype(str).str.contains(r"\$|TEST|NIFTY|BANKNIFTY", regex=True, case=False)
             & ~df["symbol"].astype(str).str.endswith(("-BE", "-BZ", "-SM", "-ST"))
         ].copy()
         
         eq = eq.drop_duplicates(subset=["symbol"]).sort_values("symbol")
         
+        clean_symbols = [str(r.symbol).removesuffix("-EQ") for r in eq.itertuples()]
+        
         if MAX_STOCKS > 0:
-            eq = eq.head(MAX_STOCKS)
+            clean_symbols = clean_symbols[:MAX_STOCKS]
             
-        result = [str(r.symbol).removesuffix("-EQ") for r in eq.itertuples()]
-        logger.info("Loaded %d NSE-EQ stocks into scan universe.", len(result))
-        return result
+        logger.info("Loaded %d clean NSE stocks into scan universe.", len(clean_symbols))
+        return clean_symbols
     except Exception as exc:
         logger.error("NSE universe fetch failed: %s", exc)
         return []
@@ -88,9 +92,9 @@ def fetch_screener_fundamentals(symbol):
         f"https://www.screener.in/company/{quote(symbol, safe='')}/",
     ]
     try:
-        time.sleep(0.3)
+        time.sleep(0.2)
         for url in urls:
-            r = SESSION.get(url, timeout=6)
+            r = SESSION.get(url, timeout=5)
             if r.status_code != 200:
                 continue
             soup = BeautifulSoup(r.content, "html.parser")
@@ -117,82 +121,75 @@ def fetch_screener_fundamentals(symbol):
     return False, {"ROE": "N/A", "ROCE": "N/A", "PE": "N/A"}
 
 
-def fetch_historical_candles_yf(symbol):
-    yf_symbol = f"{symbol}.NS"
-    try:
-        ticker = yf.Ticker(yf_symbol)
-        df = ticker.history(period="5d", interval="15m")
-        if df.empty or len(df) < 30:
-            return None
-        
-        df = df.rename(columns={"Open": "open", "High": "high", "Low": "low", "Close": "close", "Volume": "volume"})
-        return df
-    except Exception as exc:
-        logger.warning("YFinance fetch error for %s: %s", symbol, exc)
-        return None
-
-
-def analyze_stock(symbol):
-    df = fetch_historical_candles_yf(symbol)
-    if df is None or len(df) < 30:
-        return None
-
-    if df["volume"].tail(20).mean() < 1000:
-        return None
-
-    df["rsi"] = ta.momentum.rsi(df["close"], window=14)
-    df["roc"] = ta.momentum.roc(df["close"], window=12)
-    df["ema_9"] = ta.trend.ema_indicator(df["close"], window=9)
-    df["ema_21"] = ta.trend.ema_indicator(df["close"], window=21)
-    df["vol_sma"] = df["volume"].rolling(20).mean()
-    
-    df = df.dropna()
-    if len(df) < 2:
-        return None
-
-    c, p = df.iloc[-1], df.iloc[-2]
-    setups = []
-    
-    vol_sma_val = float(c["vol_sma"]) if pd.notna(c["vol_sma"]) and float(c["vol_sma"]) > 0 else 1.0
-
-    if c["close"] > p["high"] and c["volume"] >= 1.5 * vol_sma_val and c["rsi"] >= 60.0:
-        setups.append("15M Vol Breakout")
-    if p["ema_9"] <= p["ema_21"] and c["ema_9"] > c["ema_21"]:
-        setups.append("EMA Crossover")
-        
-    if not setups:
-        return None
-
-    fund_pass, fund = fetch_screener_fundamentals(symbol)
-    if not fund_pass:
-        return None
-
-    return {
-        "Symbol": symbol,
-        "LTP": round(float(c["close"]), 2),
-        "Setups": ", ".join(setups),
-        "RSI": round(float(c["rsi"]), 1),
-        "ROC": round(float(c["roc"]), 1),
-        "ROE": fund["ROE"],
-        "PE": fund["PE"],
-    }
-
-
 def execute_master_scan():
-    universe = fetch_nse_stock_universe()
-    if not universe:
+    symbols = fetch_clean_nse_universe()
+    if not symbols:
         return
 
-    matches = []
-    total = len(universe)
+    # Map symbols for Yahoo Finance batch download
+    yf_tickers = [f"{s}.NS" for s in symbols]
+    logger.info("Downloading batch 15m candle data for %d stocks...", len(yf_tickers))
     
-    for i, symbol in enumerate(universe, 1):
-        if i % 50 == 0:
-            logger.info("Progress: Processed %d/%d stocks...", i, total)
-        
-        result = analyze_stock(symbol)
-        if result:
-            matches.append(result)
+    # Download multi-ticker batch data in 1 single network call
+    batch_data = yf.download(yf_tickers, period="5d", interval="15m", group_by="ticker", progress=False, threads=True)
+    
+    matches = []
+    
+    for symbol in symbols:
+        try:
+            yf_symbol = f"{symbol}.NS"
+            if yf_symbol in batch_data.columns.levels[0]:
+                df = batch_data[yf_symbol].copy().dropna(subset=["Close"])
+            else:
+                continue
+                
+            if df.empty or len(df) < 30:
+                continue
+
+            # Standardize columns
+            df.columns = [c.lower() for c in df.columns]
+
+            if df["volume"].tail(20).mean() < 1000:
+                continue
+
+            df["rsi"] = ta.momentum.rsi(df["close"], window=14)
+            df["roc"] = ta.momentum.roc(df["close"], window=12)
+            df["ema_9"] = ta.trend.ema_indicator(df["close"], window=9)
+            df["ema_21"] = ta.trend.ema_indicator(df["close"], window=21)
+            df["vol_sma"] = df["volume"].rolling(20).mean()
+            
+            df = df.dropna()
+            if len(df) < 2:
+                continue
+
+            c, p = df.iloc[-1], df.iloc[-2]
+            setups = []
+            
+            vol_sma_val = float(c["vol_sma"]) if pd.notna(c["vol_sma"]) and float(c["vol_sma"]) > 0 else 1.0
+
+            if c["close"] > p["high"] and c["volume"] >= 1.5 * vol_sma_val and c["rsi"] >= 60.0:
+                setups.append("15M Vol Breakout")
+            if p["ema_9"] <= p["ema_21"] and c["ema_9"] > c["ema_21"]:
+                setups.append("EMA Crossover")
+                
+            if not setups:
+                continue
+
+            fund_pass, fund = fetch_screener_fundamentals(symbol)
+            if not fund_pass:
+                continue
+
+            matches.append({
+                "Symbol": symbol,
+                "LTP": round(float(c["close"]), 2),
+                "Setups": ", ".join(setups),
+                "RSI": round(float(c["rsi"]), 1),
+                "ROC": round(float(c["roc"]), 1),
+                "ROE": fund["ROE"],
+                "PE": fund["PE"],
+            })
+        except Exception:
+            continue
 
     now_str = dt.now(IST).strftime("%I:%M %p")
     if matches:
@@ -207,7 +204,7 @@ def execute_master_scan():
             )
         send_telegram("\n".join(lines))
     else:
-        send_telegram(f"📊 <b>Market Scan:</b> Scanned {total} stocks. No stock matched setup conditions.")
+        send_telegram(f"📊 <b>Market Scan:</b> Scanned {len(symbols)} stocks. No stock matched setup conditions.")
 
 
 if __name__ == "__main__":
