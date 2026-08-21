@@ -60,7 +60,7 @@ MIN_WEEKLY_RSI = 55.0
 ENABLE_200_EMA_FILTER = True  # Institutional trend filter
 
 # LIVE MONITORING CONFIG
-MAX_WORKERS = 2  # Strict 3 req/sec rate limit compliance
+MAX_WORKERS = 2  # Strict rate limit compliance
 MASTER_FILE_LOCAL = "OpenAPIScripMaster.json"
 
 LOG_FILE = "fno_scan_log.csv"
@@ -325,6 +325,7 @@ def analyze_stock_multi_tf(stock, auth_token):
 
     if send_alert:
         tg_msg = (
+            f"📁 <b>FILE: intraday_screener.py</b>\n"
             f"⚡ <b>LIVE BREAKOUT DETECTED (DAILY + WEEKLY)</b>\n\n"
             f"<b>Stock:</b> {symbol}\n"
             f"<b>LTP:</b> ₹{entry_p}\n"
@@ -377,7 +378,11 @@ def run_live_scanner():
         print("=" * 80 + "\n")
     else:
         logger.info("Scan finished: Zero stocks matched dual timeframe momentum setup.")
-        send_telegram_alert("📊 <b>Dual-TF Scanner Report:</b> Completed scan. No stock qualified strict Multi-Timeframe rules currently.", bypass_time_check=True)
+        send_telegram_alert(
+            "📁 <b>FILE: intraday_screener.py</b>\n"
+            "📊 <b>Dual-TF Scanner Report:</b> Completed scan. No stock qualified strict Multi-Timeframe rules currently.",
+            bypass_time_check=True
+        )
 
 
 if __name__ == "__main__":
@@ -391,16 +396,3 @@ if __name__ == "__main__":
         logger.info(
             "Outside live trading hours (Mon-Fri, 09:15-15:15 IST). Skipping scan execution."
         )
-
-for item in qualified_matches:
-            tg_msg = (
-                f"📁 <b>FILE: intraday_screener.py</b>\n"
-                f"⚡ <b>5-MIN INTRADAY BREAKOUT ALERT</b>\n\n"
-                f"<b>Symbol:</b> {item['Symbol']}\n"
-                f"<b>LTP:</b> ₹{item['LTP']}\n"
-                f"<b>Change:</b> {item['Change%']}%\n"
-                f"<b>RSI (14):</b> {item['RSI(14)']}\n"
-                f"<b>Volume Surge:</b> {item['VolRatio']}x\n"
-                f"<b>Signal:</b> {item['Signal']}"
-            )
-            send_telegram_alert(tg_msg)
