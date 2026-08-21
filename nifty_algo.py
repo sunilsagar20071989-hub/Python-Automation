@@ -1191,3 +1191,15 @@ if __name__ == "__main__":
 
     logger.info("Market hours finished. Stopping engine.")
     sys.exit(0)
+
+# Nifty script ke main() function ke andar replace karein:
+tg_msg = (
+    f"📁 <b>FILE: nifty_screener.py</b>\n"  # <-- Apni Nifty file ka exact naam yahan likhein
+    f"📊 <b>NIFTY BREAKOUT / SETUP ALERT</b>\n\n"
+    f"<b>Symbol:</b> NIFTY\n"
+    f"<b>LTP:</b> ₹{item['LTP']}\n"
+    f"<b>Change:</b> {item['Change%']}%\n"
+    f"<b>RSI:</b> {item['RSI']}\n"
+    f"<b>Signal:</b> {item['Signal']}"
+)
+send_telegram_alert(tg_msg)
