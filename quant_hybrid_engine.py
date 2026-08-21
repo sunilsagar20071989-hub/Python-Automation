@@ -1,4 +1,4 @@
-# HYBRID QUANT SCREENER (SUPER-FAST & RELIABLE)
+# HYBRID QUANT SCREENER (INTRADAY + EOD MARKET SCANNER)
 from datetime import datetime as dt
 import html
 import logging
@@ -7,8 +7,8 @@ import pytz
 import requests
 import ta
 import yfinance as yf
+import pandas as pd
 
-# Mute extra logs
 logging.getLogger("yfinance").setLevel(logging.CRITICAL)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("FullMarketScreener")
@@ -67,20 +67,36 @@ def fetch_clean_nse_universe():
         return []
 
 
+def is_market_hours():
+    now = dt.now(IST)
+    # Mon-Fri between 9:15 AM and 3:30 PM
+    if now.weekday() < 5:
+        start = now.replace(hour=9, minute=15, second=0, microsecond=0)
+        end = now.replace(hour=15, minute=30, second=0, microsecond=0)
+        return start <= now <= end
+    return False
+
+
 def execute_master_scan():
-    import pandas as pd
     symbols = fetch_clean_nse_universe()
     if not symbols:
         return
 
     yf_tickers = [f"{s}.NS" for s in symbols]
-    logger.info("Downloading batch 15m candle data for %d stocks...", len(yf_tickers))
     
-    # Fast vectorized batch download
-    batch_data = yf.download(yf_tickers, period="5d", interval="15m", group_by="ticker", progress=False, threads=True)
+    # Auto-detect Market Time vs After Market Hours
+    live_market = is_market_hours()
     
+    if live_market:
+        logger.info("Live Market Detected: Running 15M Intraday Scan...")
+        period, interval = "5d", "15m"
+    else:
+        logger.info("After Market Closed: Running Daily (1D) EOD Scan...")
+        period, interval = "60d", "1d"
+
+    batch_data = yf.download(yf_tickers, period=period, interval=interval, group_by="ticker", progress=False, threads=True)
     matches = []
-    
+
     for symbol in symbols:
         try:
             yf_symbol = f"{symbol}.NS"
@@ -89,13 +105,12 @@ def execute_master_scan():
             else:
                 continue
                 
-            if df.empty or len(df) < 30:
+            if df.empty or len(df) < 20:
                 continue
 
             df.columns = [c.lower() for c in df.columns]
 
-            # Minimum volume check
-            if df["volume"].tail(20).mean() < 1000:
+            if df["volume"].tail(20).mean() < 5000:
                 continue
 
             # Indicators
@@ -111,14 +126,13 @@ def execute_master_scan():
 
             c, p = df.iloc[-1], df.iloc[-2]
             setups = []
-            
             vol_sma_val = float(c["vol_sma"]) if pd.notna(c["vol_sma"]) and float(c["vol_sma"]) > 0 else 1.0
 
-            # Technical Setups
+            # Momentum Criteria
             if c["close"] > p["high"] and c["volume"] >= 1.2 * vol_sma_val and c["rsi"] >= 60.0:
-                setups.append("15M Vol Breakout")
+                setups.append("Price & Vol Breakout")
             if p["ema_9"] <= p["ema_21"] and c["ema_9"] > c["ema_21"] and c["rsi"] >= 55.0:
-                setups.append("EMA Bullish Crossover")
+                setups.append("Bullish EMA Crossover")
                 
             if not setups:
                 continue
@@ -133,9 +147,11 @@ def execute_master_scan():
         except Exception:
             continue
 
-    now_str = dt.now(IST).strftime("%I:%M %p")
+    now_str = dt.now(IST).strftime("%I:%M %p | %d-%b-%Y")
+    mode_title = "INTRADAY SCANNER" if live_market else "EOD MARKET REPORT (DAILY CHART)"
+    
     if matches:
-        lines = [f"🔍 <b>QUANT MOMENTUM SCANNER ({html.escape(now_str)})</b>", ""]
+        lines = [f"📊 <b>{mode_title}</b>\n<code>{html.escape(now_str)}</code>\n"]
         for m in matches:
             lines.append(
                 f"<b>Stock:</b> {html.escape(m['Symbol'])} | <b>LTP:</b> ₹{m['LTP']}\n"
@@ -145,7 +161,7 @@ def execute_master_scan():
             )
         send_telegram("\n".join(lines))
     else:
-        send_telegram(f"📊 <b>Market Scan:</b> Scanned {len(symbols)} stocks. No setup triggered currently.")
+        send_telegram(f"📊 <b>{mode_title}:</b> Scanned {len(symbols)} stocks. No stock matched parameters.")
 
 
 if __name__ == "__main__":
