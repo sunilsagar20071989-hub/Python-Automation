@@ -1,13 +1,19 @@
-name: Quant Full Market Screener Workflow
+name: Quant Hybrid Screener Run
 
 on:
   schedule:
-    - cron: '15 4-9 * * 1-5'
-  workflow_dispatch:
+    # Mon-Fri 9:15 AM to 3:30 PM IST
+    - cron: '15,30,45,0 4-9 * * 1-5'
+  workflow_dispatch: # Manual Run Button Enable Karta Hai
+
+concurrency:
+  group: smartapi-screener
+  cancel-in-progress: true
 
 jobs:
-  run-quant-screener:
+  run-screener:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     steps:
       - name: Checkout Code
@@ -16,12 +22,12 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version: '3.11'
 
       - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pandas requests pyotp smartapi-python python-dotenv ta pytz bs4 logzero websocket-client
+          pip install smartapi-python pandas ta beautifulsoup4 requests pyotp pytz
 
       - name: Execute Screener
         env:
@@ -31,6 +37,5 @@ jobs:
           SMARTAPI_TOTP_SECRET: ${{ secrets.SMARTAPI_TOTP_SECRET }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          TZ: "Asia/Kolkata"
-        run: |
-          python quant_hybrid_engine.py
+          FULL_MARKET_MAX_STOCKS: "100"
+        run: python quant_hybrid_engine.py
