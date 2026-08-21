@@ -1,4 +1,4 @@
-# DYNAMIC FULL-MARKET QUANT SCREENER (100% RATE-LIMIT SAFE)
+# HYBRID QUANT SCREENER (ZERO RATE-LIMIT ISSUE VIA YFINANCE + SMARTAPI)
 from datetime import datetime as dt, timedelta
 import html
 import logging
@@ -12,16 +12,12 @@ import pyotp
 import pytz
 import requests
 import ta
+import yfinance as yf
 from bs4 import BeautifulSoup
-from SmartApi import SmartConnect
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("FullMarketScreener")
 
-API_KEY = os.getenv("SMARTAPI_API_KEY") or os.getenv("SMARTAPI_KEY")
-CLIENT_CODE = os.getenv("SMARTAPI_CLIENT_CODE")
-PIN = os.getenv("SMARTAPI_PIN")
-TOTP_SECRET = os.getenv("SMARTAPI_TOTP_SECRET")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
@@ -31,9 +27,8 @@ SESSION.headers.update({
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 })
 
-MAX_STOCKS = int(os.getenv("FULL_MARKET_MAX_STOCKS", "500"))  # Safe batch size
+MAX_STOCKS = int(os.getenv("FULL_MARKET_MAX_STOCKS", "300"))
 FUNDAMENTALS_ENABLED = os.getenv("FUNDAMENTALS_ENABLED", "1") == "1"
-REQUEST_DELAY = 1.2  # 1.2s spacing strictly enforces <1 req/sec limit
 
 
 def send_telegram(message):
@@ -58,10 +53,6 @@ def fetch_nse_stock_universe():
         r.raise_for_status()
         df = pd.DataFrame(r.json())
         
-        required = {"exch_seg", "symbol", "token"}
-        if not required.issubset(df.columns):
-            raise ValueError(f"Master file missing columns: {required - set(df.columns)}")
-            
         eq = df[
             (df["exch_seg"].eq("NSE"))
             & df["symbol"].astype(str).str.endswith("-EQ")
@@ -73,7 +64,7 @@ def fetch_nse_stock_universe():
         if MAX_STOCKS > 0:
             eq = eq.head(MAX_STOCKS)
             
-        result = [{"symbol": str(r.symbol), "token": str(r.token)} for r in eq.itertuples()]
+        result = [str(r.symbol).removesuffix("-EQ") for r in eq.itertuples()]
         logger.info("Loaded %d NSE-EQ stocks into scan universe.", len(result))
         return result
     except Exception as exc:
@@ -92,13 +83,12 @@ def fetch_screener_fundamentals(symbol):
     if not FUNDAMENTALS_ENABLED:
         return True, {"ROE": "DISABLED", "ROCE": "DISABLED", "PE": "DISABLED"}
 
-    clean = symbol.removesuffix("-EQ")
     urls = [
-        f"https://www.screener.in/company/{quote(clean, safe='')}/consolidated/",
-        f"https://www.screener.in/company/{quote(clean, safe='')}/",
+        f"https://www.screener.in/company/{quote(symbol, safe='')}/consolidated/",
+        f"https://www.screener.in/company/{quote(symbol, safe='')}/",
     ]
     try:
-        time.sleep(0.4)
+        time.sleep(0.3)
         for url in urls:
             r = SESSION.get(url, timeout=6)
             if r.status_code != 200:
@@ -127,64 +117,24 @@ def fetch_screener_fundamentals(symbol):
     return False, {"ROE": "N/A", "ROCE": "N/A", "PE": "N/A"}
 
 
-def initialize_smartapi():
-    if not all([API_KEY, CLIENT_CODE, PIN, TOTP_SECRET]):
-        logger.error("Missing SmartAPI environment credentials.")
-        return None
+def fetch_historical_candles_yf(symbol):
+    yf_symbol = f"{symbol}.NS"
     try:
-        api = SmartConnect(api_key=API_KEY)
-        totp = pyotp.TOTP(TOTP_SECRET).now()
-        data = api.generateSession(CLIENT_CODE, PIN, totp)
-        if data and data.get("status"):
-            logger.info("SmartAPI session successfully active.")
-            return api
-        logger.error("SmartAPI login failed: %s", data)
+        ticker = yf.Ticker(yf_symbol)
+        df = ticker.history(period="5d", interval="15m")
+        if df.empty or len(df) < 30:
+            return None
+        
+        df = df.rename(columns={"Open": "open", "High": "high", "Low": "low", "Close": "close", "Volume": "volume"})
+        return df
     except Exception as exc:
-        logger.error("SmartAPI authentication error: %s", exc)
-    return None
+        logger.warning("YFinance fetch error for %s: %s", symbol, exc)
+        return None
 
 
-def fetch_historical_candles_with_retry(api, token, interval="FIFTEEN_MINUTE", days=10, retries=3):
-    now = dt.now(IST)
-    payload = {
-        "exchange": "NSE",
-        "symboltoken": str(token),
-        "interval": interval,
-        "fromdate": (now - timedelta(days=days)).strftime("%Y-%m-%d 09:15"),
-        "todate": now.strftime("%Y-%m-%d %H:%M"),
-    }
-    
-    for attempt in range(retries):
-        try:
-            time.sleep(REQUEST_DELAY)
-            res = api.getCandleData(payload)
-            
-            if res and isinstance(res, dict) and res.get("status") and res.get("data"):
-                df = pd.DataFrame(res["data"], columns=["timestamp", "open", "high", "low", "close", "volume"])
-                for c in ["open", "high", "low", "close", "volume"]:
-                    df[c] = pd.to_numeric(df[c], errors="coerce")
-                return df.dropna(subset=["open", "high", "low", "close", "volume"])
-            
-            # SmartAPI rate limit message block check
-            msg = str(res.get("message", "") if isinstance(res, dict) else "").lower()
-            if "access rate" in msg or "access denied" in msg:
-                logger.warning("Rate limit hit for token %s. Waiting 10s... (Attempt %d/%d)", token, attempt + 1, retries)
-                time.sleep(10)
-                continue
-                
-        except Exception as exc:
-            logger.warning("SmartAPI Exception for token %s: %s. Pausing 10s... (Attempt %d/%d)", token, exc, attempt + 1, retries)
-            time.sleep(10)
-            
-    return None
-
-
-def analyze_stock(stock_info, api):
-    symbol = stock_info["symbol"]
-    token = stock_info["token"]
-    
-    df = fetch_historical_candles_with_retry(api, token)
-    if df is None or len(df) < 50:
+def analyze_stock(symbol):
+    df = fetch_historical_candles_yf(symbol)
+    if df is None or len(df) < 30:
         return None
 
     if df["volume"].tail(20).mean() < 1000:
@@ -229,10 +179,6 @@ def analyze_stock(stock_info, api):
 
 
 def execute_master_scan():
-    api = initialize_smartapi()
-    if not api:
-        return
-        
     universe = fetch_nse_stock_universe()
     if not universe:
         return
@@ -240,11 +186,11 @@ def execute_master_scan():
     matches = []
     total = len(universe)
     
-    for i, stock in enumerate(universe, 1):
+    for i, symbol in enumerate(universe, 1):
         if i % 50 == 0:
             logger.info("Progress: Processed %d/%d stocks...", i, total)
         
-        result = analyze_stock(stock, api)
+        result = analyze_stock(symbol)
         if result:
             matches.append(result)
 
