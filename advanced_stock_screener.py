@@ -1,294 +1,208 @@
+# ADVANCED F&O 5-MINUTE MOMENTUM SCREENER (OPTIMIZED)
 import concurrent.futures
 from datetime import datetime, time as dtime, timedelta
 import os
 import sys
 import time
-from dotenv import load_dotenv
+
 import pandas as pd
 import pyotp
 import pytz
 import requests
 import ta
+from dotenv import load_dotenv
 from SmartApi import SmartConnect
 
-# ==========================================
-# 1. CONFIGURATION & SECURE ENVIRONMENT VARIABLES
-# ==========================================
 load_dotenv()
-
 API_KEY = os.getenv("SMARTAPI_KEY") or os.getenv("SMARTAPI_API_KEY")
 CLIENT_CODE = os.getenv("SMARTAPI_CLIENT_CODE")
 PIN = os.getenv("SMARTAPI_PIN")
 TOTP_SECRET = os.getenv("SMARTAPI_TOTP_SECRET")
-
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-# STRATEGY THRESHOLDS
-MIN_RSI = 60.0        # System standard RSI >= 60
-MIN_ROC = 0.0         # ROC must be > 0
-MIN_VOL_SURGE_RATIO = 1.2  # Volume >= 1.2x of 21-period SMA Volume
-TIMEFRAME = "FIVE_MINUTE"  # Live Intraday Scanning (5-Min Candles)
-MAX_WORKERS = 10      # Multi-threading for high-speed scanning
+MIN_RSI = 60.0
+MIN_ROC = 0.0
+MIN_VOL_SURGE_RATIO = 1.2
+TIMEFRAME = "FIVE_MINUTE"
+MAX_WORKERS = 3         # Optimized for SmartAPI limits
+REQUEST_DELAY = 0.35    # Strictly tuned to avoid HTTP 429 while maxing speed
+IST = pytz.timezone("Asia/Kolkata")
+SESSION = requests.Session()
 
 
-# ==========================================
-# 2. MARKET HOURS CHECK
-# ==========================================
 def is_market_open():
-    """Ensures alerts are sent during trading hours (09:15 to 15:25 IST)."""
-    IST = pytz.timezone("Asia/Kolkata")
     now = datetime.now(IST).time()
     return dtime(9, 15) <= now <= dtime(15, 25)
 
 
-# ==========================================
-# 3. DYNAMIC F&O UNIVERSE FETCH
-# ==========================================
 def fetch_dynamic_fno_universe():
-    print(">>> Downloading Angel One Master Instrument File...")
     urls = [
         "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json",
         "https://margincalculator.angelone.in/OpenAPI_File/files/OpenAPIScripMaster.json",
     ]
-    headers = {"User-Agent": "Mozilla/5.0"}
-
-    for scrip_url in urls:
+    for url in urls:
         try:
-            resp = requests.get(scrip_url, headers=headers, timeout=15)
-            if resp.status_code == 200:
-                data = resp.json()
-                df_master = pd.DataFrame(data)
-
-                nfo_df = df_master[df_master["exch_seg"] == "NFO"]
-                fno_symbols = set(nfo_df["name"].dropna().unique())
-
-                nse_eq_df = df_master[
-                    (df_master["exch_seg"] == "NSE")
-                    & (df_master["symbol"].astype(str).str.endswith("-EQ"))
-                    & (df_master["name"].isin(fno_symbols))
-                ]
-
-                fno_list = []
-                for _, row in nse_eq_df.iterrows():
-                    fno_list.append({"symbol": str(row["symbol"]), "token": str(row["token"])})
-
-                print(f">>> Successfully loaded {len(fno_list)} F&O stocks dynamically!\n")
-                return fno_list
+            r = SESSION.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=20)
+            r.raise_for_status()
+            df = pd.DataFrame(r.json())
+            required = {"exch_seg", "name", "symbol", "token"}
+            if not required.issubset(df.columns):
+                continue
+            nfo_names = set(df.loc[df["exch_seg"].eq("NFO"), "name"].dropna().astype(str))
+            eq = df[
+                df["exch_seg"].eq("NSE")
+                & df["symbol"].astype(str).str.endswith("-EQ")
+                & df["name"].astype(str).isin(nfo_names)
+            ].drop_duplicates("symbol")
+            return [{"symbol": str(r.symbol), "token": str(r.token)} for r in eq.itertuples()]
         except Exception:
             continue
-
-    print(">>> Dynamic Universe Fetch Failed.")
     return []
 
 
-# ==========================================
-# 4. TELEGRAM NOTIFICATION ENGINE
-# ==========================================
 def send_telegram_alert(message, bypass_time_check=False, max_retries=3):
-    """Sends HTML formatted Telegram notifications."""
-    IST = pytz.timezone("Asia/Kolkata")
-    current_time = datetime.now(IST).time()
-
-    if not bypass_time_check and current_time > dtime(15, 30):
-        print(f"Alert Skipped: Current IST time ({current_time.strftime('%H:%M')}) is past market cutoff.")
+    now = datetime.now(IST).time()
+    if not bypass_time_check and now > dtime(15, 30):
         return
-
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
-
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": message,
-        "parse_mode": "HTML",
-    }
-
     for attempt in range(max_retries):
         try:
-            response = requests.post(url, data=payload, timeout=5)
-            if response.status_code == 200:
-                return
-        except requests.exceptions.RequestException as e:
-            if attempt == max_retries - 1:
-                print(f"Telegram Alert Error: {e}")
-            time.sleep(1)
-
-
-# ==========================================
-# 5. LOGIN & AUTHENTICATION
-# ==========================================
-def initialize_smartapi():
-    try:
-        if not all([API_KEY, CLIENT_CODE, PIN, TOTP_SECRET]):
-            print(">>> Error: Missing environment variables.")
-            return None
-
-        smart_api = SmartConnect(api_key=API_KEY)
-        totp_code = pyotp.TOTP(TOTP_SECRET).now()
-        data = smart_api.generateSession(CLIENT_CODE, PIN, totp_code)
-
-        if data and data.get("status"):
-            raw_token = data["data"]["jwtToken"]
-            auth_token = raw_token if raw_token.startswith("Bearer ") else f"Bearer {raw_token}"
-            print("\n" + "=" * 85)
-            print(">>> SmartAPI Authenticated! Stock Screener Active...")
-            print("=" * 85 + "\n")
-            return auth_token
-        else:
-            print(">>> Authentication failed response:", data)
-    except Exception as e:
-        print(">>> Authentication Exception:", e)
-    return None
-
-
-# ==========================================
-# 6. INTRADAY DATA FETCH & PROCESSING
-# ==========================================
-def fetch_candle_data_direct(auth_token, token, interval=TIMEFRAME, days=5, exchange="NSE"):
-    url = "https://apiconnect.angelone.in/rest/secure/angelbroking/historical/v1/getCandleData"
-
-    headers = {
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-        "X-PrivateKey": API_KEY,
-        "X-UserType": "USER",
-        "X-SourceID": "WEB",
-        "X-ClientLocalIP": "127.0.0.1",
-        "X-ClientPublicIP": "127.0.0.1",
-        "X-MACAddress": "FE:80:00:00:00:00",
-        "Authorization": auth_token,
-    }
-
-    now = datetime.now()
-    to_date = now.strftime("%Y-%m-%d %H:%M")
-    from_date = (now - timedelta(days=days)).strftime("%Y-%m-%d 09:15")
-
-    payload = {
-        "exchange": exchange,
-        "symboltoken": str(token),
-        "interval": interval,
-        "fromdate": from_date,
-        "todate": to_date,
-    }
-
-    try:
-        resp = requests.post(url, headers=headers, json=payload, timeout=8)
-        resp_json = resp.json()
-
-        if resp_json.get("status") and resp_json.get("data"):
-            df = pd.DataFrame(
-                resp_json["data"],
-                columns=["timestamp", "open", "high", "low", "close", "volume"],
+            r = SESSION.post(
+                url,
+                data={"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"},
+                timeout=8,
             )
-            df["close"] = df["close"].astype(float)
-            df["high"] = df["high"].astype(float)
-            df["low"] = df["low"].astype(float)
-            df["volume"] = df["volume"].astype(float)
-            return df
-    except Exception:
-        pass
-    return None
+            if r.status_code == 200:
+                return
+        except requests.RequestException:
+            pass
+        time.sleep(1 + attempt)
 
 
-def evaluate_stock_setup(auth_token, stock):
-    symbol = stock["symbol"]
-    token = stock["token"]
-
-    df = fetch_candle_data_direct(auth_token, token, interval=TIMEFRAME, days=5)
-    if df is None or len(df) < 50:
+def initialize_smartapi():
+    if not all([API_KEY, CLIENT_CODE, PIN, TOTP_SECRET]):
+        print("Missing SmartAPI environment variables.")
+        return None
+    try:
+        api = SmartConnect(api_key=API_KEY)
+        data = api.generateSession(CLIENT_CODE, PIN, pyotp.TOTP(TOTP_SECRET).now())
+        return api if data and data.get("status") else None
+    except Exception as exc:
+        print("Authentication failed:", exc)
         return None
 
-    # Indicator Calculation
+
+def fetch_candle_data(api, token, interval=TIMEFRAME, days=6):
+    """Days limit set to 6 days (~450 candles) for reliable 200 EMA calculation without API timeout."""
+    now = datetime.now(IST)
+    payload = {
+        "exchange": "NSE",
+        "symboltoken": str(token),
+        "interval": interval,
+        "fromdate": (now - timedelta(days=days)).strftime("%Y-%m-%d 09:15"),
+        "todate": now.strftime("%Y-%m-%d %H:%M"),
+    }
+    try:
+        res = api.getCandleData(payload)
+        if not res or not res.get("status") or not res.get("data"):
+            return None
+        df = pd.DataFrame(res["data"], columns=["timestamp", "open", "high", "low", "close", "volume"])
+        for c in ["open", "high", "low", "close", "volume"]:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+        return df.dropna()
+    except Exception:
+        return None
+
+
+def evaluate_stock_setup(api, stock):
+    time.sleep(REQUEST_DELAY)
+    df = fetch_candle_data(api, stock["token"])
+    if df is None or len(df) < 205:
+        return None
+
     df["rsi"] = ta.momentum.rsi(df["close"], window=14)
     df["roc"] = ta.momentum.roc(df["close"], window=9)
     df["ema_9"] = ta.trend.ema_indicator(df["close"], window=9)
     df["ema_21"] = ta.trend.ema_indicator(df["close"], window=21)
-    df["ema_200"] = ta.trend.ema_indicator(df["close"], window=min(200, len(df) - 1))
-    df["vol_sma21"] = df["volume"].rolling(window=21).mean()
+    df["ema_200"] = ta.trend.ema_indicator(df["close"], window=200)
+    df["vol_sma21"] = df["volume"].rolling(21).mean()
+    df = df.dropna()
+    
+    if len(df) < 2:
+        return None
 
-    curr = df.iloc[-1]
-    prev_close = df.iloc[-2]["close"] if len(df) > 1 else curr["close"]
+    curr, prev = df.iloc[-1], df.iloc[-2]
+    
+    vol_sma_val = curr["vol_sma21"] if pd.notna(curr["vol_sma21"]) and curr["vol_sma21"] > 0 else 1.0
+    vol_ratio = curr["volume"] / vol_sma_val
+    candle_change = ((curr["close"] - prev["close"]) / prev["close"]) * 100
 
-    vol_sma = curr["vol_sma21"] if pd.notna(curr["vol_sma21"]) and curr["vol_sma21"] > 0 else 1
-    vol_ratio = curr["volume"] / vol_sma
-    day_change_pct = ((curr["close"] - prev_close) / prev_close) * 100
+    passed = (
+        curr["close"] > curr["ema_200"]
+        and curr["rsi"] >= MIN_RSI
+        and curr["roc"] > MIN_ROC
+        and vol_ratio >= MIN_VOL_SURGE_RATIO
+        and curr["ema_9"] > curr["ema_21"]
+    )
+    if not passed:
+        return None
 
-    # MOMENTUM & BREAKOUT RULES
-    ema_200_pass = curr["close"] > curr["ema_200"] if pd.notna(curr["ema_200"]) else True
-    rsi_pass = curr["rsi"] >= MIN_RSI if pd.notna(curr["rsi"]) else False
-    roc_pass = curr["roc"] > MIN_ROC if pd.notna(curr["roc"]) else False
-    vol_pass = vol_ratio >= MIN_VOL_SURGE_RATIO
-    ema_cross_pass = curr["ema_9"] > curr["ema_21"] if (pd.notna(curr["ema_9"]) and pd.notna(curr["ema_21"])) else False
-
-    if ema_200_pass and rsi_pass and roc_pass and vol_pass and ema_cross_pass:
-        return {
-            "Symbol": symbol,
-            "LTP": round(curr["close"], 2),
-            "Change%": round(day_change_pct, 2),
-            "RSI(14)": round(curr["rsi"], 2),
-            "VolRatio": round(vol_ratio, 2),
-            "Signal": "BUY / LONG BREAKOUT",
-        }
-    return None
+    return {
+        "Symbol": stock["symbol"],
+        "LTP": round(float(curr["close"]), 2),
+        "Change%": round(float(candle_change), 2),
+        "RSI(14)": round(float(curr["rsi"]), 2),
+        "VolRatio": round(float(vol_ratio), 2),
+        "Signal": "BUY / LONG MOMENTUM",
+    }
 
 
-# ==========================================
-# 7. MAIN PIPELINE
-# ==========================================
 def main():
     if not is_market_open():
-        print(">>> Market Closed! Skipping Execution.")
+        print("Market closed. Scanner execution stopped.")
+        return
+        
+    api = initialize_smartapi()
+    if not api:
+        print("SmartAPI login failed.")
+        return
+        
+    stocks = fetch_dynamic_fno_universe()
+    if not stocks:
+        print("Failed to fetch F&O stock universe.")
         return
 
-    auth_token = initialize_smartapi()
-    if not auth_token:
-        print(">>> Session initialization failed. Exiting.")
-        return
-
-    fno_stock_list = fetch_dynamic_fno_universe()
-    if not fno_stock_list:
-        print(">>> F&O Stock List fetch failed. Exiting.")
-        return
-
-    print(f">>> SCANNING {len(fno_stock_list)} F&O STOCKS...")
-    qualified_matches = []
-
+    print(f"Scanning {len(stocks)} F&O stocks for 5M Momentum setups...")
+    matches = []
+    
     with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = [executor.submit(evaluate_stock_setup, auth_token, stock) for stock in fno_stock_list]
+        futures = [executor.submit(evaluate_stock_setup, api, s) for s in stocks]
         for future in concurrent.futures.as_completed(futures):
             try:
-                match = future.result()
-                if match:
-                    qualified_matches.append(match)
+                result = future.result()
+                if result:
+                    matches.append(result)
             except Exception:
-                continue
+                pass
 
-    if qualified_matches:
-        print("\n" + "=" * 80)
-        print(" 🔥 HIGH CONVICTION BREAKOUT CANDIDATES MATCHED RULES 🔥")
-        print("=" * 80)
-        df_match = pd.DataFrame(qualified_matches)
-        print(df_match.to_string(index=False))
-
-        for item in qualified_matches:
-            tg_msg = (
+    if matches:
+        for item in matches:
+            send_telegram_alert(
                 f"📁 <b>FILE: advanced_stock_screener.py</b>\n"
-                f"🚀 <b>STOCKS BREAKOUT ALERT</b>\n\n"
+                f"🚀 <b>5M MOMENTUM ALERT</b>\n\n"
                 f"<b>Symbol:</b> {item['Symbol']}\n"
                 f"<b>LTP:</b> ₹{item['LTP']}\n"
-                f"<b>Change:</b> {item['Change%']}%\n"
-                f"<b>RSI (14):</b> {item['RSI(14)']}\n"
-                f"<b>Volume Surge:</b> {item['VolRatio']}x\n"
+                f"<b>RSI:</b> {item['RSI(14)']}\n"
+                f"<b>Volume:</b> {item['VolRatio']}x\n"
                 f"<b>Signal:</b> {item['Signal']}"
             )
-            send_telegram_alert(tg_msg)
     else:
-        print("\n>>> ZERO STOCKS MATCHED STRICT RULES.")
         send_telegram_alert(
-            f"📁 <b>FILE: advanced_stock_screener.py</b>\n"
-            f"📊 <b>Stock Screener Completed:</b> Scanned {len(fno_stock_list)} stocks. No strict breakout setup matched in this interval.",
-            bypass_time_check=False
+            f"📊 Scanned {len(stocks)} F&O stocks. No setup matched.",
+            bypass_time_check=True
         )
 
 
