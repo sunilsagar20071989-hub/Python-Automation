@@ -273,6 +273,7 @@ def main():
 
         for item in qualified_matches:
             tg_msg = (
+                f"📁 <b>FILE: advanced_stock_screener.py</b>\n"
                 f"🚀 <b>STOCKS BREAKOUT ALERT</b>\n\n"
                 f"<b>Symbol:</b> {item['Symbol']}\n"
                 f"<b>LTP:</b> ₹{item['LTP']}\n"
@@ -284,21 +285,12 @@ def main():
             send_telegram_alert(tg_msg)
     else:
         print("\n>>> ZERO STOCKS MATCHED STRICT RULES.")
-        send_telegram_alert(f"📊 <b>Stock Screener Completed:</b> Scanned {len(fno_stock_list)} stocks. No strict breakout setup matched in this interval.", bypass_time_check=False)
+        send_telegram_alert(
+            f"📁 <b>FILE: advanced_stock_screener.py</b>\n"
+            f"📊 <b>Stock Screener Completed:</b> Scanned {len(fno_stock_list)} stocks. No strict breakout setup matched in this interval.",
+            bypass_time_check=False
+        )
 
 
 if __name__ == "__main__":
     main()
-
-for item in qualified_matches:
-            tg_msg = (
-                f"📁 <b>FILE: advanced_stock_screener.py</b>\n"
-                f"🚀 <b>MULTI-TIMEFRAME MOMENTUM ALERT</b>\n\n"
-                f"<b>Stock:</b> {item['Symbol']}\n"
-                f"<b>LTP:</b> ₹{item['LTP']}\n"
-                f"<b>Daily RSI:</b> {item['Daily_RSI']}\n"
-                f"<b>Weekly RSI:</b> {item['Weekly_RSI']}\n"
-                f"<b>Volume Surge:</b> {item['VolRatio']}x\n"
-                f"<b>Signal:</b> {item['Signal']}"
-            )
-            send_telegram_alert(tg_msg)
