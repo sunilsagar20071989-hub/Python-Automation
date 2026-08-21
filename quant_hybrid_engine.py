@@ -1,25 +1,24 @@
-# ==============================================================================
-# DYNAMIC FULL-MARKET QUANT SCREENER (NSE ALL STOCKS + FUNDAMENTALS + DEPTH)
-# ==============================================================================
-
+# DYNAMIC FULL-MARKET QUANT SCREENER (OPTIMIZED)
 from datetime import datetime as dt, timedelta
+import html
 import logging
 import os
+import re
 import sys
 import time
-from bs4 import BeautifulSoup
+from urllib.parse import quote
+
 import pandas as pd
 import pyotp
 import pytz
 import requests
 import ta
+from bs4 import BeautifulSoup
 from SmartApi import SmartConnect
 
-# Logging Setup
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("FullMarketScreener")
 
-# CONFIGURATION VIA GITHUB ENVIRONMENT SECRETS
 API_KEY = os.getenv("SMARTAPI_API_KEY") or os.getenv("SMARTAPI_KEY")
 CLIENT_CODE = os.getenv("SMARTAPI_CLIENT_CODE")
 PIN = os.getenv("SMARTAPI_PIN")
@@ -28,246 +27,226 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 IST = pytz.timezone("Asia/Kolkata")
-http_session = requests.Session()
-http_session.headers.update({
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-})
+SESSION = requests.Session()
+SESSION.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
 
-# ------------------------------------------------------------------------------
-# 1. TELEGRAM NOTIFIER
-# ------------------------------------------------------------------------------
-def send_telegram(msg):
+MAX_STOCKS = int(os.getenv("FULL_MARKET_MAX_STOCKS", "0"))  # 0 = All NSE-EQ
+FUNDAMENTALS_ENABLED = os.getenv("FUNDAMENTALS_ENABLED", "1") == "1"
+
+
+def send_telegram(message):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        logger.warning("Telegram credentials missing!")
+        logger.warning("Telegram credentials missing.")
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "HTML"}
-    for attempt in range(3):
+    chunks = [message[i : i + 3500] for i in range(0, len(message), 3500)] or [""]
+    for chunk in chunks:
+        payload = {"chat_id": TELEGRAM_CHAT_ID, "text": chunk, "parse_mode": "HTML"}
         try:
-            resp = http_session.post(url, data=payload, timeout=8)
-            if resp.status_code == 200:
-                logger.info("Telegram notification sent.")
-                break
-        except Exception as e:
-            logger.error(f"Telegram retry {attempt + 1} failed: {e}")
-            time.sleep(2)
+            r = SESSION.post(url, data=payload, timeout=10)
+            r.raise_for_status()
+        except requests.RequestException as exc:
+            logger.error("Telegram error: %s", exc)
 
-# ------------------------------------------------------------------------------
-# 2. DYNAMIC NSE MARKET UNIVERSE FETCH
-# ------------------------------------------------------------------------------
-def fetch_nse_stock_universe(max_stocks=150):
-    """
-    Angel One Master Instrument JSON se saare active NSE Equity stocks download karta hai.
-    """
-    logger.info("Fetching complete NSE stock universe from Angel One master list...")
-    url = "https://margincalculator.angelbroking.com/OpenAPI_Standard_Metadata/OpenAPIScripMaster.json"
+
+def fetch_nse_stock_universe():
+    url = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
     try:
-        resp = http_session.get(url, timeout=15)
-        if resp.status_code == 200:
-            data = resp.json()
-            df = pd.DataFrame(data)
-            
-            # Filter NSE Equity Cash Stocks (-EQ)
-            eq_df = df[(df["exch_seg"] == "NSE") & (df["symbol"].str.endswith("-EQ"))].copy()
-            
-            # Junk / SME / BE series stocks filter kar rahe hain
-            eq_df = eq_df[~eq_df["symbol"].str.contains("-BE|-BZ|-SM|-ST")]
-            
-            # Active universe limit (Rate-limiting aur GitHub action execution limit ke liye)
-            stock_list = []
-            for _, row in eq_df.head(max_stocks).iterrows():
-                stock_list.append({
-                    "symbol": row["symbol"],
-                    "token": row["token"]
-                })
-            
-            logger.info(f"Successfully loaded {len(stock_list)} dynamic NSE stocks.")
-            return stock_list
-    except Exception as e:
-        logger.error(f"Failed to fetch NSE master scrip list: {e}")
-    
-    # Fallback list agar download fail ho jaaye
-    return [
-        {"symbol": "RELIANCE-EQ", "token": "2885"},
-        {"symbol": "TATASTEEL-EQ", "token": "3499"},
-        {"symbol": "INFY-EQ", "token": "1594"}
-    ]
-
-# ------------------------------------------------------------------------------
-# 3. SCREENER.IN WEB SCRAPER
-# ------------------------------------------------------------------------------
-def fetch_screener_fundamentals(symbol):
-    clean_symbol = symbol.replace("-EQ", "").replace("&", "%26")
-    url = f"https://www.screener.in/company/{clean_symbol}/consolidated/"
-    
-    try:
-        resp = http_session.get(url, timeout=5)
-        if resp.status_code != 200:
-            url = f"https://www.screener.in/company/{clean_symbol}/"
-            resp = http_session.get(url, timeout=5)
-            
-        if resp.status_code == 200:
-            soup = BeautifulSoup(resp.content, "html.parser")
-            top_ratios = soup.find_all("li", class_="flex flex-space-between")
-            
-            data = {}
-            for item in top_ratios:
-                name = item.find("span", class_="name")
-                value = item.find("span", class_="number")
-                if name and value:
-                    key = name.text.strip().lower()
-                    val_str = value.text.strip().replace(",", "")
-                    try:
-                        data[key] = float(val_str)
-                    except ValueError:
-                        data[key] = val_str
-
-            roe = data.get("return on equity", 0.0)
-            roce = data.get("return on capital employed", 0.0)
-            pe = data.get("stock p/e", 0.0)
-            
-            # Pass filters
-            pass_filter = (roe >= 10.0) and (roce >= 10.0) and (pe <= 75.0)
-            return pass_filter, {"ROE": roe, "ROCE": roce, "PE": pe}
-            
-    except Exception:
-        pass
+        r = SESSION.get(url, timeout=30)
+        r.raise_for_status()
+        df = pd.DataFrame(r.json())
         
-    return True, {"ROE": "N/A", "ROCE": "N/A", "PE": "N/A"}
+        required = {"exch_seg", "symbol", "token"}
+        if not required.issubset(df.columns):
+            raise ValueError(f"Master file missing columns: {required - set(df.columns)}")
+            
+        eq = df[
+            (df["exch_seg"].eq("NSE"))
+            & df["symbol"].astype(str).str.endswith("-EQ")
+            & ~df["symbol"].astype(str).str.contains(r"-(BE|BZ|SM|ST)$", regex=True)
+        ].copy()
+        
+        eq = eq.drop_duplicates(subset=["symbol"]).sort_values("symbol")
+        
+        if MAX_STOCKS > 0:
+            eq = eq.head(MAX_STOCKS)
+            
+        result = [{"symbol": str(r.symbol), "token": str(r.token)} for r in eq.itertuples()]
+        logger.info("Loaded %d NSE-EQ stocks into scan universe.", len(result))
+        return result
+    except Exception as exc:
+        logger.error("NSE universe fetch failed: %s", exc)
+        return []
 
-# ------------------------------------------------------------------------------
-# 4. SMARTAPI CONNECT & DEPTH
-# ------------------------------------------------------------------------------
+
+def _number(text):
+    if text is None:
+        return None
+    m = re.search(r"-?\d+(?:\.\d+)?", str(text).replace(",", ""))
+    return float(m.group()) if m else None
+
+
+def fetch_screener_fundamentals(symbol):
+    """Only invoked for stocks passing technical filters to prevent IP bans."""
+    if not FUNDAMENTALS_ENABLED:
+        return True, {"ROE": "DISABLED", "ROCE": "DISABLED", "PE": "DISABLED"}
+
+    clean = symbol.removesuffix("-EQ")
+    urls = [
+        f"https://www.screener.in/company/{quote(clean, safe='')}/consolidated/",
+        f"https://www.screener.in/company/{quote(clean, safe='')}/",
+    ]
+    try:
+        time.sleep(0.5)  # Throttle scraping speed
+        for url in urls:
+            r = SESSION.get(url, timeout=8)
+            if r.status_code != 200:
+                continue
+            soup = BeautifulSoup(r.content, "html.parser")
+            data = {}
+            for li in soup.find_all("li"):
+                name = li.find("span", class_="name")
+                value = li.find("span", class_="number")
+                if name and value:
+                    data[name.get_text(" ", strip=True).lower()] = _number(value.get_text(" ", strip=True))
+
+            roe = data.get("return on equity")
+            roce = data.get("return on capital employed")
+            pe = data.get("stock p/e")
+            
+            if roe is None or roce is None or pe is None:
+                continue
+                
+            passed = roe >= 10.0 and roce >= 10.0 and 0 < pe <= 75.0
+            return passed, {"ROE": roe, "ROCE": roce, "PE": pe}
+            
+    except Exception as exc:
+        logger.warning("Fundamental lookup failed for %s: %s", symbol, exc)
+
+    return False, {"ROE": "N/A", "ROCE": "N/A", "PE": "N/A"}
+
+
 def initialize_smartapi():
+    if not all([API_KEY, CLIENT_CODE, PIN, TOTP_SECRET]):
+        logger.error("Missing SmartAPI environment credentials.")
+        return None
     try:
-        obj = SmartConnect(api_key=API_KEY)
+        api = SmartConnect(api_key=API_KEY)
         totp = pyotp.TOTP(TOTP_SECRET).now()
-        data = obj.generateSession(CLIENT_CODE, PIN, totp)
+        data = api.generateSession(CLIENT_CODE, PIN, totp)
         if data and data.get("status"):
-            return obj, data["data"]["jwtToken"]
-    except Exception as e:
-        logger.error(f"SmartAPI Auth Failed: {e}")
-    return None, None
+            logger.info("SmartAPI session successfully active.")
+            return api
+        logger.error("SmartAPI login failed: %s", data)
+    except Exception as exc:
+        logger.error("SmartAPI authentication error: %s", exc)
+    return None
 
-def analyze_order_book_depth(smart_obj, exchange, symbol, token):
-    try:
-        res = smart_obj.getMarketDepth(exchange=exchange, symboltoken=token)
-        if res and res.get("status") and "data" in res:
-            depth_data = res["data"]
-            total_buy_qty = depth_data.get("totBuyQuan", 0)
-            total_sell_qty = depth_data.get("totSellQuan", 0)
-            total_vol = total_buy_qty + total_sell_qty
-            if total_vol > 0:
-                return round(total_buy_qty / total_vol, 2)
-    except Exception:
-        pass
-    return 0.50
 
-# ------------------------------------------------------------------------------
-# 5. TECHNICAL ANALYSIS ENGINE
-# ------------------------------------------------------------------------------
-def fetch_historical_candles(smart_obj, token, interval="FIFTEEN_MINUTE", days=12):
+def fetch_historical_candles(api, token, interval="FIFTEEN_MINUTE", days=12):
     now = dt.now(IST)
-    to_date = now.strftime("%Y-%m-%d %H:%M")
-    from_date = (now - timedelta(days=days)).strftime("%Y-%m-%d 09:15")
     payload = {
         "exchange": "NSE",
         "symboltoken": str(token),
         "interval": interval,
-        "fromdate": from_date,
-        "todate": to_date
+        "fromdate": (now - timedelta(days=days)).strftime("%Y-%m-%d 09:15"),
+        "todate": now.strftime("%Y-%m-%d %H:%M"),
     }
     try:
-        res = smart_obj.getCandleData(payload)
-        if res and res.get("status") and res.get("data"):
-            df = pd.DataFrame(res["data"], columns=["timestamp", "open", "high", "low", "close", "volume"])
-            df[["open", "high", "low", "close", "volume"]] = df[["open", "high", "low", "close", "volume"]].astype(float)
-            return df
-    except Exception:
-        pass
-    return None
-
-def analyze_stock(symbol, token, smart_obj):
-    # Historical Candles
-    df = fetch_historical_candles(smart_obj, token, interval="FIFTEEN_MINUTE", days=12)
-    if df is None or len(df) < 40:
+        res = api.getCandleData(payload)
+        if not res or not res.get("status") or not res.get("data"):
+            return None
+            
+        df = pd.DataFrame(res["data"], columns=["timestamp", "open", "high", "low", "close", "volume"])
+        for c in ["open", "high", "low", "close", "volume"]:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+            
+        df = df.dropna(subset=["open", "high", "low", "close", "volume"])
+        return df
+    except Exception as exc:
+        logger.warning("Candle fetch error for token %s: %s", token, exc)
         return None
 
-    # Technical Indicators
+
+def analyze_stock(symbol, token, api):
+    df = fetch_historical_candles(api, token)
+    if df is None or len(df) < 50:
+        return None
+
+    # Calculate Technical Indicators
     df["rsi"] = ta.momentum.rsi(df["close"], window=14)
     df["roc"] = ta.momentum.roc(df["close"], window=12)
     df["ema_9"] = ta.trend.ema_indicator(df["close"], window=9)
     df["ema_21"] = ta.trend.ema_indicator(df["close"], window=21)
     df["vol_sma"] = df["volume"].rolling(20).mean()
+    
+    df = df.dropna()
+    if len(df) < 2:
+        return None
 
-    c = df.iloc[-1]
-    p = df.iloc[-2]
-
+    c, p = df.iloc[-1], df.iloc[-2]
     setups = []
-    # 1. Momentum & Breakout (RSI 60+ & Volume Surge)
-    if c["close"] > p["high"] and c["volume"] >= (1.5 * c["vol_sma"]) and c["rsi"] >= 60:
+    
+    # 1. Technical Conditions
+    if c["close"] > p["high"] and c["volume"] >= 1.5 * c["vol_sma"] and c["rsi"] >= 60.0:
         setups.append("15M Vol Breakout")
-
-    # 2. EMA Crossover
-    if (p["ema_9"] <= p["ema_21"]) and (c["ema_9"] > c["ema_21"]):
+    if p["ema_9"] <= p["ema_21"] and c["ema_9"] > c["ema_21"]:
         setups.append("EMA Crossover")
-
-    # High Momentum Condition Filter
+        
     if not setups:
         return None
 
-    # Fundamentals Check (Only for technically qualified stocks to save API calls)
-    fund_pass, fund_metrics = fetch_screener_fundamentals(symbol)
+    # 2. Fundamental Check ONLY AFTER Technical Setup Qualifies
+    fund_pass, fund = fetch_screener_fundamentals(symbol)
     if not fund_pass:
         return None
 
-    # Order Book Depth Check
-    buyer_ratio = analyze_order_book_depth(smart_obj, "NSE", symbol, token)
-
     return {
         "Symbol": symbol,
-        "LTP": round(c["close"], 2),
+        "LTP": round(float(c["close"]), 2),
         "Setups": ", ".join(setups),
-        "RSI": round(c["rsi"], 1),
-        "ROC": round(c["roc"], 1),
-        "BuyerRatio": f"{int(buyer_ratio * 100)}%",
-        "ROE": fund_metrics.get("ROE", "N/A"),
-        "PE": fund_metrics.get("PE", "N/A"),
+        "RSI": round(float(c["rsi"]), 1),
+        "ROC": round(float(c["roc"]), 1),
+        "ROE": fund["ROE"],
+        "PE": fund["PE"],
     }
 
-# ------------------------------------------------------------------------------
-# 6. MASTER EXECUTION
-# ------------------------------------------------------------------------------
+
 def execute_master_scan():
-    smart_obj, _ = initialize_smartapi()
-    if not smart_obj:
+    api = initialize_smartapi()
+    if not api:
+        return
+        
+    universe = fetch_nse_stock_universe()
+    if not universe:
         return
 
-    # DYNAMIC UNIVERSE: Automatically fetches live market stocks
-    universe = fetch_nse_stock_universe(max_stocks=200)
-
     matches = []
-    for stock in universe:
-        res = analyze_stock(stock["symbol"], stock["token"], smart_obj)
-        if res:
-            matches.append(res)
-        time.sleep(0.3)  # Rate limiting safety
+    total = len(universe)
+    
+    for i, stock in enumerate(universe, 1):
+        result = analyze_stock(stock["symbol"], stock["token"], api)
+        if result:
+            matches.append(result)
+            
+        # Respect SmartAPI Rate Limit (~3 req/sec)
+        time.sleep(0.35)
 
     now_str = dt.now(IST).strftime("%I:%M %p")
-
     if matches:
-        msg = f"🔍 <b>FULL MARKET QUANT SCANNER ALERT ({now_str})</b> 🔍\n\n"
+        lines = [f"🔍 <b>FULL MARKET QUANT SCANNER ({html.escape(now_str)})</b>", ""]
         for m in matches:
-            msg += (
-                f"<b>Stock:</b> {m['Symbol']} | <b>LTP:</b> ₹{m['LTP']}\n"
-                f"<b>Signal:</b> {m['Setups']}\n"
-                f"<b>Metrics:</b> RSI: {m['RSI']} | ROC: {m['ROC']}% | Buyers: {m['BuyerRatio']}\n"
-                f"<b>Fundamentals:</b> ROE: {m['ROE']}% | PE: {m['PE']}\n"
-                f"-----------------------------------\n"
+            lines.append(
+                f"<b>Stock:</b> {html.escape(m['Symbol'])} | <b>LTP:</b> ₹{m['LTP']}\n"
+                f"<b>Signal:</b> {html.escape(m['Setups'])}\n"
+                f"<b>RSI:</b> {m['RSI']} | <b>ROC:</b> {m['ROC']}%\n"
+                f"<b>ROE:</b> {m['ROE']}% | <b>PE:</b> {m['PE']}\n"
+                f"-----------------------------------"
             )
-        send_telegram(msg)
+        send_telegram("\n".join(lines))
     else:
-        send_telegram(f"📊 <b>Market Scan ({now_str}):</b> Scanned {len(universe)} stocks. No stock met the strict criteria.")
+        send_telegram(f"📊 <b>Market Scan:</b> Scanned {total} stocks. No stock matched setup conditions.")
+
 
 if __name__ == "__main__":
     execute_master_scan()
