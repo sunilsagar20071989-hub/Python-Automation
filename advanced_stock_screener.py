@@ -289,3 +289,16 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+for item in qualified_matches:
+            tg_msg = (
+                f"📁 <b>FILE: advanced_stock_screener.py</b>\n"
+                f"🚀 <b>MULTI-TIMEFRAME MOMENTUM ALERT</b>\n\n"
+                f"<b>Stock:</b> {item['Symbol']}\n"
+                f"<b>LTP:</b> ₹{item['LTP']}\n"
+                f"<b>Daily RSI:</b> {item['Daily_RSI']}\n"
+                f"<b>Weekly RSI:</b> {item['Weekly_RSI']}\n"
+                f"<b>Volume Surge:</b> {item['VolRatio']}x\n"
+                f"<b>Signal:</b> {item['Signal']}"
+            )
+            send_telegram_alert(tg_msg)
