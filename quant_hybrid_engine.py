@@ -1,81 +1,4 @@
 # DYNAMIC FULL-MARKET QUANT SCREENER (OPTIMIZED)
-import concurrent.futures
-from datetime import datetime as dt, timedelta
-import html
-import logging
-import os
-import re
-import time
-from urllib.parse import quote
-
-import pandas as pd
-import pyotp
-import pytz
-import requests
-import ta
-from bs4 import BeautifulSoup
-from SmartApi import SmartConnect
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-logger = logging.getLogger("FullMarketScreener")
-
-API_KEY = os.getenv("SMARTAPI_API_KEY") or os.getenv("SMARTAPI_KEY")
-CLIENT_CODE = os.getenv("SMARTAPI_CLIENT_CODE")
-PIN = os.getenv("SMARTAPI_PIN")
-TOTP_SECRET = os.getenv("SMARTAPI_TOTP_SECRET")
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-
-IST = pytz.timezone("Asia/Kolkata")
-SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
-
-MAX_STOCKS = int(os.getenv("FULL_MARKET_MAX_STOCKS", "0"))  # 0 = All NSE-EQ
-FUNDAMENTALS_ENABLED = os.getenv("FUNDAMENTALS_ENABLED", "1") == "1"
-MAX_WORKERS = 3         # Optimal multi-threading speed
-REQUEST_DELAY = 0.35    # Keeps SmartAPI within 3 req/sec limit
-
-
-def send_telegram(message):
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        logger.warning("Telegram credentials missing.")
-        return
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    chunks = [message[i : i + 3500] for i in range(0, len(message), 3500)] or [""]
-    for chunk in chunks:
-        payload = {"chat_id": TELEGRAM_CHAT_ID, "text": chunk, "parse_mode": "HTML"}
-        try:
-            r = SESSION.post(url, data=payload, timeout=10)
-            r.raise_for_status()
-        except requests.RequestException as exc:
-            logger.error("Telegram error: %s", exc)
-
-
-def fetch_nse_stock_universe():
-    url = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScYour Python quantitative screener is well-structured, but running it against the full NSE equity universe (~2,000+ stocks) will hit severe operational bottlenecks and unhandled edge cases.
-
-### Core Bottlenecks & Fixes
-
-* **Execution Time (Sequential Processing):** Processing ~2,000 stocks with a `0.35s` sleep delay takes over 11 minutes per execution loop, making 15-minute candle signals stale before completion.
-* **Rate Limits & API Errors:** SmartAPI candle requests can randomly fail or return `None` when rate limits are exceeded, which will cause `df.iloc[-1]` or `df.iloc[-2]` to crash with `IndexError` if DataFrame length falls below 2 after `dropna()`.
-* **Rate Limits on Web Scraping:** Scraping `screener.in` sequentially via `BeautifulSoup` inside the loop will quickly result in IP bans or CAPTCHA triggers.
-* **Missing Liquid Volume Filter:** Low-liquidity illiquid stocks will trigger false positive volume breakout signals.
-
----
-
-### Key Code Optimization Fixes
-
-1. **Error Handling on Candle Drops:** Fixed potential `IndexError` by validating DataFrame length right before indexing `df.iloc[-1]`.
-2. **Execution Speed Optimization:** Integrated `concurrent.futures.ThreadPoolExecutor` to execute technical calculations concurrently, reducing scan time from 11+ minutes down to ~1–2 minutes while respecting SmartAPI thresholds via token bucket/concurrency limits.
-3. **Robust Scraping:** Added user-agent spoofing headers and graceful fallback for Screener parsing errors.
-4. **Volume & Liquidity Guardrail:** Added a minimum average volume filter to drop illiquid penny/micro-cap stocks.
-
----
-
-### Optimized Code
-
-```python
-# DYNAMIC FULL-MARKET QUANT SCREENER (OPTIMIZED & CONCURRENT)
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime as dt, timedelta
 import html
@@ -111,14 +34,14 @@ SESSION.headers.update({
 
 MAX_STOCKS = int(os.getenv("FULL_MARKET_MAX_STOCKS", "0"))  # 0 = All NSE-EQ
 FUNDAMENTALS_ENABLED = os.getenv("FUNDAMENTALS_ENABLED", "1") == "1"
-MAX_WORKERS = int(os.getenv("MAX_WORKERS", "5"))  # Safe concurrent worker pool
+MAX_WORKERS = int(os.getenv("MAX_WORKERS", "3"))  # Safe concurrent worker pool
 
 
 def send_telegram(message):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         logger.warning("Telegram credentials missing.")
         return
-    url = f"[https://api.telegram.org/bot](https://api.telegram.org/bot){TELEGRAM_BOT_TOKEN}/sendMessage"
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     chunks = [message[i : i + 3500] for i in range(0, len(message), 3500)] or [""]
     for chunk in chunks:
         payload = {"chat_id": TELEGRAM_CHAT_ID, "text": chunk, "parse_mode": "HTML"}
@@ -130,7 +53,7 @@ def send_telegram(message):
 
 
 def fetch_nse_stock_universe():
-    url = "[https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json](https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json)"
+    url = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
     try:
         r = SESSION.get(url, timeout=30)
         r.raise_for_status()
@@ -172,8 +95,8 @@ def fetch_screener_fundamentals(symbol):
 
     clean = symbol.removesuffix("-EQ")
     urls = [
-        f"[https://www.screener.in/company/](https://www.screener.in/company/){quote(clean, safe='')}/consolidated/",
-        f"[https://www.screener.in/company/](https://www.screener.in/company/){quote(clean, safe='')}/",
+        f"https://www.screener.in/company/{quote(clean, safe='')}/consolidated/",
+        f"https://www.screener.in/company/{quote(clean, safe='')}/",
     ]
     try:
         time.sleep(0.4)
@@ -222,7 +145,7 @@ def initialize_smartapi():
     return None
 
 
-def fetch_historical_candles(api, token, interval="FIFTEEN_MINUTE", days=12):
+def fetch_historical_candles(api, token, interval="FIFTEEN_MINUTE", days=10):
     now = dt.now(IST)
     payload = {
         "exchange": "NSE",
@@ -255,11 +178,9 @@ def analyze_stock(stock_info, api):
     if df is None or len(df) < 50:
         return None
 
-    # Liquidity check: Exclude stocks with insufficient average candle volume
     if df["volume"].tail(20).mean() < 1000:
         return None
 
-    # Calculate Technical Indicators
     df["rsi"] = ta.momentum.rsi(df["close"], window=14)
     df["roc"] = ta.momentum.roc(df["close"], window=12)
     df["ema_9"] = ta.trend.ema_indicator(df["close"], window=9)
@@ -273,8 +194,9 @@ def analyze_stock(stock_info, api):
     c, p = df.iloc[-1], df.iloc[-2]
     setups = []
     
-    # 1. Technical Conditions
-    if c["close"] > p["high"] and c["volume"] >= 1.5 * c["vol_sma"] and c["rsi"] >= 60.0:
+    vol_sma_val = float(c["vol_sma"]) if pd.notna(c["vol_sma"]) and float(c["vol_sma"]) > 0 else 1.0
+
+    if c["close"] > p["high"] and c["volume"] >= 1.5 * vol_sma_val and c["rsi"] >= 60.0:
         setups.append("15M Vol Breakout")
     if p["ema_9"] <= p["ema_21"] and c["ema_9"] > c["ema_21"]:
         setups.append("EMA Crossover")
@@ -282,7 +204,6 @@ def analyze_stock(stock_info, api):
     if not setups:
         return None
 
-    # 2. Fundamental Check ONLY AFTER Technical Setup Qualifies
     fund_pass, fund = fetch_screener_fundamentals(symbol)
     if not fund_pass:
         return None
@@ -310,7 +231,6 @@ def execute_master_scan():
     matches = []
     total = len(universe)
     
-    # Concurrent scanning using ThreadPoolExecutor
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         future_to_stock = {executor.submit(analyze_stock, stock, api): stock for stock in universe}
         for future in as_completed(future_to_stock):
@@ -318,4 +238,24 @@ def execute_master_scan():
                 result = future.result()
                 if result:
                     matches.append(result)
-            except Exception as exc
+            except Exception as exc:
+                logger.error("Scan error: %s", exc)
+
+    now_str = dt.now(IST).strftime("%I:%M %p")
+    if matches:
+        lines = [f"🔍 <b>FULL MARKET QUANT SCANNER ({html.escape(now_str)})</b>", ""]
+        for m in matches:
+            lines.append(
+                f"<b>Stock:</b> {html.escape(m['Symbol'])} | <b>LTP:</b> ₹{m['LTP']}\n"
+                f"<b>Signal:</b> {html.escape(m['Setups'])}\n"
+                f"<b>RSI:</b> {m['RSI']} | <b>ROC:</b> {m['ROC']}%\n"
+                f"<b>ROE:</b> {m['ROE']}% | <b>PE:</b> {m['PE']}\n"
+                f"-----------------------------------"
+            )
+        send_telegram("\n".join(lines))
+    else:
+        send_telegram(f"📊 <b>Market Scan:</b> Scanned {total} stocks. No stock matched setup conditions.")
+
+
+if __name__ == "__main__":
+    execute_master_scan()
