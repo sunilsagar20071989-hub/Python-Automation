@@ -1,4 +1,4 @@
-# DYNAMIC FULL-MARKET QUANT SCREENER (RATE-LIMIT PROOF)
+# DYNAMIC FULL-MARKET QUANT SCREENER (100% RATE-LIMIT SAFE)
 from datetime import datetime as dt, timedelta
 import html
 import logging
@@ -31,9 +31,9 @@ SESSION.headers.update({
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 })
 
-MAX_STOCKS = int(os.getenv("FULL_MARKET_MAX_STOCKS", "500"))  # Default set to top 500 liquid stocks for safe runtime
+MAX_STOCKS = int(os.getenv("FULL_MARKET_MAX_STOCKS", "500"))  # Safe batch size
 FUNDAMENTALS_ENABLED = os.getenv("FUNDAMENTALS_ENABLED", "1") == "1"
-REQUEST_DELAY = 1.05  # Strict 1 req/sec rate limit compliance
+REQUEST_DELAY = 1.2  # 1.2s spacing strictly enforces <1 req/sec limit
 
 
 def send_telegram(message):
@@ -144,8 +144,7 @@ def initialize_smartapi():
     return None
 
 
-def fetch_historical_candles_with_retry(api, token, interval="FIFTEEN_MINUTE", days=10, retries=2):
-    """Fetches candle data with exponential retry backoff if rate limit occurs."""
+def fetch_historical_candles_with_retry(api, token, interval="FIFTEEN_MINUTE", days=10, retries=3):
     now = dt.now(IST)
     payload = {
         "exchange": "NSE",
@@ -155,32 +154,28 @@ def fetch_historical_candles_with_retry(api, token, interval="FIFTEEN_MINUTE", d
         "todate": now.strftime("%Y-%m-%d %H:%M"),
     }
     
-    for attempt in range(retries + 1):
+    for attempt in range(retries):
         try:
             time.sleep(REQUEST_DELAY)
             res = api.getCandleData(payload)
             
-            if res and isinstance(res, dict):
-                if res.get("status") and res.get("data"):
-                    df = pd.DataFrame(res["data"], columns=["timestamp", "open", "high", "low", "close", "volume"])
-                    for c in ["open", "high", "low", "close", "volume"]:
-                        df[c] = pd.to_numeric(df[c], errors="coerce")
-                    return df.dropna(subset=["open", "high", "low", "close", "volume"])
+            if res and isinstance(res, dict) and res.get("status") and res.get("data"):
+                df = pd.DataFrame(res["data"], columns=["timestamp", "open", "high", "low", "close", "volume"])
+                for c in ["open", "high", "low", "close", "volume"]:
+                    df[c] = pd.to_numeric(df[c], errors="coerce")
+                return df.dropna(subset=["open", "high", "low", "close", "volume"])
+            
+            # SmartAPI rate limit message block check
+            msg = str(res.get("message", "") if isinstance(res, dict) else "").lower()
+            if "access rate" in msg or "access denied" in msg:
+                logger.warning("Rate limit hit for token %s. Waiting 10s... (Attempt %d/%d)", token, attempt + 1, retries)
+                time.sleep(10)
+                continue
                 
-                # Check for rate limit response message
-                msg = str(res.get("message", "")).lower()
-                if "exceeding access rate" in msg or "access denied" in msg:
-                    logger.warning("Rate limit hit for token %s. Pausing 5 seconds... (Attempt %d)", token, attempt + 1)
-                    time.sleep(5)
-                    continue
-
-            return None
         except Exception as exc:
-            if attempt < retries:
-                time.sleep(3)
-            else:
-                logger.warning("Candle fetch failed for token %s: %s", token, exc)
-                return None
+            logger.warning("SmartAPI Exception for token %s: %s. Pausing 10s... (Attempt %d/%d)", token, exc, attempt + 1, retries)
+            time.sleep(10)
+            
     return None
 
 
