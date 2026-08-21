@@ -1,20 +1,14 @@
-# HYBRID QUANT SCREENER (LIGHTNING FAST BATCH YFINANCE)
+# HYBRID QUANT SCREENER (SUPER-FAST & RELIABLE)
 from datetime import datetime as dt
 import html
 import logging
 import os
-import re
-import time
-from urllib.parse import quote
-
-import pandas as pd
 import pytz
 import requests
 import ta
 import yfinance as yf
-from bs4 import BeautifulSoup
 
-# Suppress noisy logger outputs from yfinance
+# Mute extra logs
 logging.getLogger("yfinance").setLevel(logging.CRITICAL)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("FullMarketScreener")
@@ -25,11 +19,10 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 IST = pytz.timezone("Asia/Kolkata")
 SESSION = requests.Session()
 SESSION.headers.update({
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
 })
 
 MAX_STOCKS = int(os.getenv("FULL_MARKET_MAX_STOCKS", "300"))
-FUNDAMENTALS_ENABLED = os.getenv("FUNDAMENTALS_ENABLED", "1") == "1"
 
 
 def send_telegram(message):
@@ -54,7 +47,6 @@ def fetch_clean_nse_universe():
         r.raise_for_status()
         df = pd.DataFrame(r.json())
         
-        # Filter genuine equity stocks and exclude test / non-tradeable symbols
         eq = df[
             (df["exch_seg"].eq("NSE"))
             & df["symbol"].astype(str).str.endswith("-EQ")
@@ -63,7 +55,6 @@ def fetch_clean_nse_universe():
         ].copy()
         
         eq = eq.drop_duplicates(subset=["symbol"]).sort_values("symbol")
-        
         clean_symbols = [str(r.symbol).removesuffix("-EQ") for r in eq.itertuples()]
         
         if MAX_STOCKS > 0:
@@ -76,61 +67,16 @@ def fetch_clean_nse_universe():
         return []
 
 
-def _number(text):
-    if text is None:
-        return None
-    m = re.search(r"-?\d+(?:\.\d+)?", str(text).replace(",", ""))
-    return float(m.group()) if m else None
-
-
-def fetch_screener_fundamentals(symbol):
-    if not FUNDAMENTALS_ENABLED:
-        return True, {"ROE": "DISABLED", "ROCE": "DISABLED", "PE": "DISABLED"}
-
-    urls = [
-        f"https://www.screener.in/company/{quote(symbol, safe='')}/consolidated/",
-        f"https://www.screener.in/company/{quote(symbol, safe='')}/",
-    ]
-    try:
-        time.sleep(0.2)
-        for url in urls:
-            r = SESSION.get(url, timeout=5)
-            if r.status_code != 200:
-                continue
-            soup = BeautifulSoup(r.content, "html.parser")
-            data = {}
-            for li in soup.find_all("li"):
-                name = li.find("span", class_="name")
-                value = li.find("span", class_="number")
-                if name and value:
-                    data[name.get_text(" ", strip=True).lower()] = _number(value.get_text(" ", strip=True))
-
-            roe = data.get("return on equity")
-            roce = data.get("return on capital employed")
-            pe = data.get("stock p/e")
-            
-            if roe is None or roce is None or pe is None:
-                continue
-                
-            passed = roe >= 10.0 and roce >= 10.0 and 0 < pe <= 75.0
-            return passed, {"ROE": roe, "ROCE": roce, "PE": pe}
-            
-    except Exception as exc:
-        logger.warning("Fundamental lookup failed for %s: %s", symbol, exc)
-
-    return False, {"ROE": "N/A", "ROCE": "N/A", "PE": "N/A"}
-
-
 def execute_master_scan():
+    import pandas as pd
     symbols = fetch_clean_nse_universe()
     if not symbols:
         return
 
-    # Map symbols for Yahoo Finance batch download
     yf_tickers = [f"{s}.NS" for s in symbols]
     logger.info("Downloading batch 15m candle data for %d stocks...", len(yf_tickers))
     
-    # Download multi-ticker batch data in 1 single network call
+    # Fast vectorized batch download
     batch_data = yf.download(yf_tickers, period="5d", interval="15m", group_by="ticker", progress=False, threads=True)
     
     matches = []
@@ -146,12 +92,13 @@ def execute_master_scan():
             if df.empty or len(df) < 30:
                 continue
 
-            # Standardize columns
             df.columns = [c.lower() for c in df.columns]
 
+            # Minimum volume check
             if df["volume"].tail(20).mean() < 1000:
                 continue
 
+            # Indicators
             df["rsi"] = ta.momentum.rsi(df["close"], window=14)
             df["roc"] = ta.momentum.roc(df["close"], window=12)
             df["ema_9"] = ta.trend.ema_indicator(df["close"], window=9)
@@ -167,16 +114,13 @@ def execute_master_scan():
             
             vol_sma_val = float(c["vol_sma"]) if pd.notna(c["vol_sma"]) and float(c["vol_sma"]) > 0 else 1.0
 
-            if c["close"] > p["high"] and c["volume"] >= 1.5 * vol_sma_val and c["rsi"] >= 60.0:
+            # Technical Setups
+            if c["close"] > p["high"] and c["volume"] >= 1.2 * vol_sma_val and c["rsi"] >= 60.0:
                 setups.append("15M Vol Breakout")
-            if p["ema_9"] <= p["ema_21"] and c["ema_9"] > c["ema_21"]:
-                setups.append("EMA Crossover")
+            if p["ema_9"] <= p["ema_21"] and c["ema_9"] > c["ema_21"] and c["rsi"] >= 55.0:
+                setups.append("EMA Bullish Crossover")
                 
             if not setups:
-                continue
-
-            fund_pass, fund = fetch_screener_fundamentals(symbol)
-            if not fund_pass:
                 continue
 
             matches.append({
@@ -185,26 +129,23 @@ def execute_master_scan():
                 "Setups": ", ".join(setups),
                 "RSI": round(float(c["rsi"]), 1),
                 "ROC": round(float(c["roc"]), 1),
-                "ROE": fund["ROE"],
-                "PE": fund["PE"],
             })
         except Exception:
             continue
 
     now_str = dt.now(IST).strftime("%I:%M %p")
     if matches:
-        lines = [f"🔍 <b>FULL MARKET QUANT SCANNER ({html.escape(now_str)})</b>", ""]
+        lines = [f"🔍 <b>QUANT MOMENTUM SCANNER ({html.escape(now_str)})</b>", ""]
         for m in matches:
             lines.append(
                 f"<b>Stock:</b> {html.escape(m['Symbol'])} | <b>LTP:</b> ₹{m['LTP']}\n"
                 f"<b>Signal:</b> {html.escape(m['Setups'])}\n"
-                f"<b>RSI:</b> {m['RSI']} | <b>ROC:</b> {m['ROC']}%\n"
-                f"<b>ROE:</b> {m['ROE']}% | <b>PE:</b> {m['PE']}\n"
+                f"<b>RSI (14):</b> {m['RSI']} | <b>ROC (12):</b> {m['ROC']}%\n"
                 f"-----------------------------------"
             )
         send_telegram("\n".join(lines))
     else:
-        send_telegram(f"📊 <b>Market Scan:</b> Scanned {len(symbols)} stocks. No stock matched setup conditions.")
+        send_telegram(f"📊 <b>Market Scan:</b> Scanned {len(symbols)} stocks. No setup triggered currently.")
 
 
 if __name__ == "__main__":
