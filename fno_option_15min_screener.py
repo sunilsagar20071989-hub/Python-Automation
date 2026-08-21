@@ -368,3 +368,15 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+for item in matches:
+            tg_msg = (
+                f"📁 <b>FILE: fno_option_15min_screener.py</b>\n"
+                f"🎯 <b>STRICT HIGH CONVICTION OPTION TRADE</b>\n\n"
+                f"<b>Stock:</b> {item['Symbol']}\n"
+                f"<b>Action:</b> {item['Option_Action']}\n"
+                f"<b>LTP:</b> ₹{item['Live_LTP']}\n"
+                f"<b>Vol Ratio:</b> {item['VolRatio']}x\n"
+                f"<b>SL:</b> ₹{item['SL_Price']} | <b>Target (1:2):</b> ₹{item['Target_Price']}"
+            )
+            send_telegram_alert(tg_msg)
