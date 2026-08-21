@@ -1,5 +1,4 @@
-# DYNAMIC FULL-MARKET QUANT SCREENER (OPTIMIZED)
-from concurrent.futures import ThreadPoolExecutor, as_completed
+# DYNAMIC FULL-MARKET QUANT SCREENER (RATE-LIMIT SAFE)
 from datetime import datetime as dt, timedelta
 import html
 import logging
@@ -34,7 +33,7 @@ SESSION.headers.update({
 
 MAX_STOCKS = int(os.getenv("FULL_MARKET_MAX_STOCKS", "0"))  # 0 = All NSE-EQ
 FUNDAMENTALS_ENABLED = os.getenv("FUNDAMENTALS_ENABLED", "1") == "1"
-MAX_WORKERS = int(os.getenv("MAX_WORKERS", "3"))  # Safe concurrent worker pool
+REQUEST_DELAY = 0.35  # Strict throttle to respect ~3 req/sec rate limit
 
 
 def send_telegram(message):
@@ -66,7 +65,7 @@ def fetch_nse_stock_universe():
         eq = df[
             (df["exch_seg"].eq("NSE"))
             & df["symbol"].astype(str).str.endswith("-EQ")
-            & ~df["symbol"].astype(str).str.contains(r"-(BE|BZ|SM|ST)$", regex=True)
+            & ~df["symbol"].astype(str).str.endswith(("-BE", "-BZ", "-SM", "-ST"))
         ].copy()
         
         eq = eq.drop_duplicates(subset=["symbol"]).sort_values("symbol")
@@ -174,6 +173,9 @@ def analyze_stock(stock_info, api):
     symbol = stock_info["symbol"]
     token = stock_info["token"]
     
+    # Controlled delay for rate limiting
+    time.sleep(REQUEST_DELAY)
+    
     df = fetch_historical_candles(api, token)
     if df is None or len(df) < 50:
         return None
@@ -231,15 +233,10 @@ def execute_master_scan():
     matches = []
     total = len(universe)
     
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        future_to_stock = {executor.submit(analyze_stock, stock, api): stock for stock in universe}
-        for future in as_completed(future_to_stock):
-            try:
-                result = future.result()
-                if result:
-                    matches.append(result)
-            except Exception as exc:
-                logger.error("Scan error: %s", exc)
+    for stock in universe:
+        result = analyze_stock(stock, api)
+        if result:
+            matches.append(result)
 
     now_str = dt.now(IST).strftime("%I:%M %p")
     if matches:
