@@ -391,3 +391,16 @@ if __name__ == "__main__":
         logger.info(
             "Outside live trading hours (Mon-Fri, 09:15-15:15 IST). Skipping scan execution."
         )
+
+for item in qualified_matches:
+            tg_msg = (
+                f"📁 <b>FILE: intraday_screener.py</b>\n"
+                f"⚡ <b>5-MIN INTRADAY BREAKOUT ALERT</b>\n\n"
+                f"<b>Symbol:</b> {item['Symbol']}\n"
+                f"<b>LTP:</b> ₹{item['LTP']}\n"
+                f"<b>Change:</b> {item['Change%']}%\n"
+                f"<b>RSI (14):</b> {item['RSI(14)']}\n"
+                f"<b>Volume Surge:</b> {item['VolRatio']}x\n"
+                f"<b>Signal:</b> {item['Signal']}"
+            )
+            send_telegram_alert(tg_msg)
