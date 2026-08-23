@@ -1,4 +1,4 @@
-# HYBRID QUANT SCREENER (SECURE ENV LOAD)
+# HYBRID QUANT SCREENER (SECURE & HYBRID ENV LOADER)
 from datetime import datetime as dt
 import html
 import logging
@@ -8,9 +8,29 @@ import requests
 import ta
 import yfinance as yf
 import pandas as pd
-from dotenv import load_dotenv
 
-load_dotenv()
+# Safe & Dynamic Env Loader (Local PC + GitHub Actions Universal Support)
+try:
+    from dotenv import load_dotenv
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+    for env_file in ["secret.env", "secret.env.txt", ".env"]:
+        env_path = os.path.join(BASE_DIR, env_file)
+        if os.path.exists(env_path):
+            load_dotenv(env_path)
+            break
+except ImportError:
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+    for fname in ["secret.env", "secret.env.txt", ".env"]:
+        fpath = os.path.join(BASE_DIR, fname)
+        if os.path.exists(fpath):
+            with open(fpath, "r", encoding="utf-8") as f:
+                for line in f:
+                    if line.strip() and not line.startswith("#") and "=" in line:
+                        k, v = line.strip().split("=", 1)
+                        os.environ[k.strip()] = v.strip().strip('"').strip("'")
+            break
+
+# Credentials Fetch
 API_KEY = os.getenv("SMARTAPI_KEY") or os.getenv("SMARTAPI_API_KEY")
 CLIENT_CODE = os.getenv("SMARTAPI_CLIENT_CODE")
 PIN = os.getenv("SMARTAPI_PIN")
@@ -93,7 +113,7 @@ def execute_master_scan():
     mode_title = "INTRADAY SCANNER" if live_market else "EOD MARKET REPORT (DAILY CHART)"
     mode_text = "Intraday 15M" if live_market else "EOD Daily"
     
-    # Heartbeat
+    # Heartbeat Signal
     send_telegram(f"⚡ <b>Engine Active:</b> Scanning {len(symbols)} NSE stocks [{mode_text}] at <code>{html.escape(now_str)}</code>...")
 
     yf_tickers = [f"{s}.NS" for s in symbols]
