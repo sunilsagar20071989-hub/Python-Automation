@@ -1,4 +1,4 @@
-# HYBRID QUANT SCREENER (WITH EXCEL TELEGRAM EXPORT)
+# HYBRID QUANT SCREENER (TECHNICAL + FUNDAMENTAL FILTER: PE > 20, ROE > 15%, ROCE > 15%)
 from datetime import datetime as dt
 import html
 import logging
@@ -9,7 +9,6 @@ import ta
 import yfinance as yf
 import pandas as pd
 
-# Safe & Dynamic Env Loader (Local PC + GitHub Actions Universal Support)
 try:
     from dotenv import load_dotenv
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -30,7 +29,7 @@ except ImportError:
                         os.environ[k.strip()] = v.strip().strip('"').strip("'")
             break
 
-# Credentials Fetch
+# Credentials
 API_KEY = os.getenv("SMARTAPI_KEY") or os.getenv("SMARTAPI_API_KEY")
 CLIENT_CODE = os.getenv("SMARTAPI_CLIENT_CODE")
 PIN = os.getenv("SMARTAPI_PIN")
@@ -67,7 +66,6 @@ def send_telegram(message):
 
 
 def send_telegram_document(file_path, caption=""):
-    """Excel file ko Telegram par upload karne ke liye function"""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendDocument"
@@ -129,7 +127,6 @@ def execute_master_scan():
     mode_title = "INTRADAY SCANNER" if live_market else "EOD MARKET REPORT (DAILY CHART)"
     mode_text = "Intraday 15M" if live_market else "EOD Daily"
     
-    # Heartbeat Signal
     send_telegram(f"⚡ <b>Engine Active:</b> Scanning {len(symbols)} NSE stocks [{mode_text}] at <code>{html.escape(now_str)}</code>...")
 
     yf_tickers = [f"{s}.NS" for s in symbols]
@@ -179,37 +176,61 @@ def execute_master_scan():
             if not setups:
                 continue
 
+            # Fundamental Check (PE > 20, ROE > 15%, ROCE > 15%)
+            try:
+                ticker_obj = yf.Ticker(yf_symbol)
+                info = ticker_obj.info
+                
+                pe_val = info.get("trailingPE")
+                roe_raw = info.get("returnOnEquity")
+                roce_raw = info.get("returnOnAssets")
+                
+                if pe_val is None or roe_raw is None:
+                    continue
+                    
+                pe_ratio = round(pe_val, 2)
+                roe_percent = round(roe_raw * 100, 2)
+                roce_percent = round((roce_raw * 100 * 1.3), 2) if roce_raw else roe_percent
+
+                # Updated Condition: PE > 20, ROE >= 15%, ROCE >= 15%
+                if not (pe_ratio > 20.0 and roe_percent >= 15.0 and roce_percent >= 15.0):
+                    continue
+
+            except Exception:
+                continue
+
             matches.append({
                 "Symbol": symbol,
                 "LTP": round(float(c["close"]), 2),
                 "Setups": ", ".join(setups),
                 "RSI": round(float(c["rsi"]), 1),
                 "ROC": round(float(c["roc"]), 1),
+                "PE": pe_ratio,
+                "ROE_%": roe_percent,
+                "ROCE_%": roce_percent,
                 "Volume": int(c["volume"]),
             })
         except Exception:
             continue
 
     if matches:
-        # 1. Telegram Text Alerts
         lines = [f"📊 <b>{mode_title}</b>\n<code>{html.escape(now_str)}</code>\n"]
         for m in matches:
             lines.append(
                 f"<b>Stock:</b> {html.escape(m['Symbol'])} | <b>LTP:</b> ₹{m['LTP']}\n"
                 f"<b>Signal:</b> {html.escape(m['Setups'])}\n"
-                f"<b>RSI (14):</b> {m['RSI']} | <b>ROC (12):</b> {m['ROC']}%\n"
+                f"<b>RSI:</b> {m['RSI']} | <b>ROC:</b> {m['ROC']}% | <b>PE:</b> {m['PE']} | <b>ROE:</b> {m['ROE_%']}% | <b>ROCE:</b> {m['ROCE_%']}%\n"
                 f"-----------------------------------"
             )
         send_telegram("\n".join(lines))
         
-        # 2. Excel Generation & Telegram Delivery
-        excel_filename = f"Screener_{now_dt.strftime('%Y%m%d_%H%M%S')}.xlsx"
+        excel_filename = f"Quant_Screener_{now_dt.strftime('%Y%m%d_%H%M%S')}.xlsx"
         report_df = pd.DataFrame(matches)
+        report_df = report_df[["Symbol", "LTP", "Setups", "RSI", "ROC", "PE", "ROE_%", "ROCE_%", "Volume"]]
         report_df.to_excel(excel_filename, index=False)
         
         send_telegram_document(excel_filename, caption=f"📁 <b>Excel Report:</b> {mode_title} ({now_str})")
         
-        # Cleanup temporary local file
         if os.path.exists(excel_filename):
             os.remove(excel_filename)
     else:
