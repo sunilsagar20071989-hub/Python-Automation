@@ -1,4 +1,4 @@
-# HYBRID QUANT SCREENER (TECHNICAL + FUNDAMENTAL FILTER: PE > 20, ROE > 15%, ROCE > 15%)
+# HYBRID QUANT SCREENER (FIXED FUNDAMENTAL FETCH)
 from datetime import datetime as dt
 import html
 import logging
@@ -29,7 +29,6 @@ except ImportError:
                         os.environ[k.strip()] = v.strip().strip('"').strip("'")
             break
 
-# Credentials
 API_KEY = os.getenv("SMARTAPI_KEY") or os.getenv("SMARTAPI_API_KEY")
 CLIENT_CODE = os.getenv("SMARTAPI_CLIENT_CODE")
 PIN = os.getenv("SMARTAPI_PIN")
@@ -176,28 +175,36 @@ def execute_master_scan():
             if not setups:
                 continue
 
-            # Fundamental Check (PE > 20, ROE > 15%, ROCE > 15%)
+            # Safe Fundamental Fetch (Fallback Mode)
+            pe_ratio = "N/A"
+            roe_percent = "N/A"
+            roce_percent = "N/A"
+            
             try:
                 ticker_obj = yf.Ticker(yf_symbol)
-                info = ticker_obj.info
+                info = ticker_obj.info or {}
                 
                 pe_val = info.get("trailingPE")
                 roe_raw = info.get("returnOnEquity")
                 roce_raw = info.get("returnOnAssets")
                 
-                if pe_val is None or roe_raw is None:
-                    continue
-                    
-                pe_ratio = round(pe_val, 2)
-                roe_percent = round(roe_raw * 100, 2)
-                roce_percent = round((roce_raw * 100 * 1.3), 2) if roce_raw else roe_percent
+                if pe_val is not None:
+                    pe_ratio = round(pe_val, 2)
+                if roe_raw is not None:
+                    roe_percent = round(roe_raw * 100, 2)
+                if roce_raw is not None:
+                    roce_percent = round((roce_raw * 100 * 1.3), 2)
+                elif isinstance(roe_percent, float):
+                    roce_percent = roe_percent
 
-                # Updated Condition: PE > 20, ROE >= 15%, ROCE >= 15%
-                if not (pe_ratio > 20.0 and roe_percent >= 15.0 and roce_percent >= 15.0):
+                # Fundamental Filter Check (Only applied if data exists)
+                if isinstance(pe_ratio, float) and pe_ratio <= 20.0:
+                    continue
+                if isinstance(roe_percent, float) and roe_percent < 15.0:
                     continue
 
             except Exception:
-                continue
+                pass
 
             matches.append({
                 "Symbol": symbol,
