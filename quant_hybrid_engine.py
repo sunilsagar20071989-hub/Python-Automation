@@ -116,7 +116,6 @@ def execute_master_scan():
         try:
             yf_symbol = f"{symbol}.NS"
             
-            # Robust extraction of single stock dataframe from yfinance batch download
             if isinstance(batch_data.columns, pd.MultiIndex):
                 if yf_symbol in batch_data.columns.levels[0]:
                     df = batch_data[yf_symbol].copy()
@@ -132,11 +131,9 @@ def execute_master_scan():
 
             df.columns = [c.lower() for c in df.columns]
 
-            # Liquidity Filter: 20-day Average Volume > 3000
             if df["volume"].tail(20).mean() < 3000:
                 continue
 
-            # Core Technical Setup Calculations
             df["rsi"] = ta.momentum.rsi(df["close"], window=14)
             df["roc"] = ta.momentum.roc(df["close"], window=12)
             df["ema_9"] = ta.trend.ema_indicator(df["close"], window=9)
@@ -151,14 +148,11 @@ def execute_master_scan():
             setups = []
             vol_sma_val = float(c["vol_sma"]) if pd.notna(c["vol_sma"]) and float(c["vol_sma"]) > 0 else 1.0
 
-            # Signal 1: High Conviction Breakout
             if c["close"] > p["high"] and c["volume"] >= 1.2 * vol_sma_val and c["rsi"] >= 60.0:
                 setups.append("🔥 High Conviction Breakout")
-            # Signal 2: Early Momentum Buildup
             elif c["close"] > p["high"] and c["rsi"] >= 58.0:
                 setups.append("📈 Early Momentum Buildup")
 
-            # Signal 3: Bullish EMA Crossover
             if p["ema_9"] <= p["ema_21"] and c["ema_9"] > c["ema_21"] and c["rsi"] >= 55.0:
                 setups.append("⚡ Bullish EMA Crossover")
                 
