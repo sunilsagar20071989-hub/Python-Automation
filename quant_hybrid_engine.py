@@ -1,4 +1,4 @@
-# HYBRID QUANT SCREENER (SECURE & HYBRID ENV LOADER)
+# HYBRID QUANT SCREENER (WITH EXCEL TELEGRAM EXPORT)
 from datetime import datetime as dt
 import html
 import logging
@@ -66,6 +66,21 @@ def send_telegram(message):
             logger.error("Telegram error: %s", exc)
 
 
+def send_telegram_document(file_path, caption=""):
+    """Excel file ko Telegram par upload karne ke liye function"""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendDocument"
+    try:
+        with open(file_path, "rb") as doc:
+            files = {"document": doc}
+            data = {"chat_id": TELEGRAM_CHAT_ID, "caption": caption, "parse_mode": "HTML"}
+            r = SESSION.post(url, data=data, files=files, timeout=30)
+            r.raise_for_status()
+    except Exception as exc:
+        logger.error("Telegram document error: %s", exc)
+
+
 def fetch_clean_nse_universe():
     url = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
     try:
@@ -107,7 +122,8 @@ def execute_master_scan():
     if not symbols:
         return
 
-    now_str = dt.now(IST).strftime("%I:%M %p | %d-%b-%Y")
+    now_dt = dt.now(IST)
+    now_str = now_dt.strftime("%I:%M %p | %d-%b-%Y")
     live_market = is_market_hours()
     
     mode_title = "INTRADAY SCANNER" if live_market else "EOD MARKET REPORT (DAILY CHART)"
@@ -169,11 +185,13 @@ def execute_master_scan():
                 "Setups": ", ".join(setups),
                 "RSI": round(float(c["rsi"]), 1),
                 "ROC": round(float(c["roc"]), 1),
+                "Volume": int(c["volume"]),
             })
         except Exception:
             continue
 
     if matches:
+        # 1. Telegram Text Alerts
         lines = [f"📊 <b>{mode_title}</b>\n<code>{html.escape(now_str)}</code>\n"]
         for m in matches:
             lines.append(
@@ -183,6 +201,17 @@ def execute_master_scan():
                 f"-----------------------------------"
             )
         send_telegram("\n".join(lines))
+        
+        # 2. Excel Generation & Telegram Delivery
+        excel_filename = f"Screener_{now_dt.strftime('%Y%m%d_%H%M%S')}.xlsx"
+        report_df = pd.DataFrame(matches)
+        report_df.to_excel(excel_filename, index=False)
+        
+        send_telegram_document(excel_filename, caption=f"📁 <b>Excel Report:</b> {mode_title} ({now_str})")
+        
+        # Cleanup temporary local file
+        if os.path.exists(excel_filename):
+            os.remove(excel_filename)
     else:
         send_telegram(f"📊 <b>{mode_title}:</b> Scanned {len(symbols)} stocks. No stock matched setup parameters.")
 
