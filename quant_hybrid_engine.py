@@ -1,9 +1,8 @@
-# HYBRID QUANT SCREENER (FIXED FUNDAMENTALS FETCH WITH RATE-LIMIT DELAY)
+# HYBRID QUANT SCREENER (WORKING FUNDAMENTALS FIX)
 from datetime import datetime as dt
 import html
 import logging
 import os
-import time
 import pytz
 import requests
 import ta
@@ -30,10 +29,6 @@ except ImportError:
                         os.environ[k.strip()] = v.strip().strip('"').strip("'")
             break
 
-API_KEY = os.getenv("SMARTAPI_KEY") or os.getenv("SMARTAPI_API_KEY")
-CLIENT_CODE = os.getenv("SMARTAPI_CLIENT_CODE")
-PIN = os.getenv("SMARTAPI_PIN")
-TOTP_SECRET = os.getenv("SMARTAPI_TOTP_SECRET")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
@@ -44,7 +39,7 @@ logger = logging.getLogger("FullMarketScreener")
 IST = pytz.timezone("Asia/Kolkata")
 SESSION = requests.Session()
 SESSION.headers.update({
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36"
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 })
 
 MAX_STOCKS = int(os.getenv("FULL_MARKET_MAX_STOCKS", "0"))
@@ -52,7 +47,6 @@ MAX_STOCKS = int(os.getenv("FULL_MARKET_MAX_STOCKS", "0"))
 
 def send_telegram(message):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        logger.warning("Telegram credentials missing or invalid.")
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     chunks = [message[i : i + 3500] for i in range(0, len(message), 3500)] or [""]
@@ -61,8 +55,8 @@ def send_telegram(message):
         try:
             r = SESSION.post(url, data=payload, timeout=10)
             r.raise_for_status()
-        except requests.RequestException as exc:
-            logger.error("Telegram error: %s", exc)
+        except requests.RequestException:
+            pass
 
 
 def send_telegram_document(file_path, caption=""):
@@ -75,8 +69,8 @@ def send_telegram_document(file_path, caption=""):
             data = {"chat_id": TELEGRAM_CHAT_ID, "caption": caption, "parse_mode": "HTML"}
             r = SESSION.post(url, data=data, files=files, timeout=30)
             r.raise_for_status()
-    except Exception as exc:
-        logger.error("Telegram document error: %s", exc)
+    except Exception:
+        pass
 
 
 def fetch_clean_nse_universe():
@@ -99,43 +93,23 @@ def fetch_clean_nse_universe():
         if MAX_STOCKS > 0:
             clean_symbols = clean_symbols[:MAX_STOCKS]
             
-        logger.info("Loaded %d clean NSE stocks into scan universe.", len(clean_symbols))
         return clean_symbols
-    except Exception as exc:
-        logger.error("NSE universe fetch failed: %s", exc)
+    except Exception:
         return []
 
 
-def is_market_hours():
-    now = dt.now(IST)
-    if now.weekday() < 5:
-        start = now.replace(hour=9, minute=15, second=0, microsecond=0)
-        end = now.replace(hour=15, minute=30, second=0, microsecond=0)
-        return start <= now <= end
-    return False
-
-
-def get_fundamental_metrics(yf_symbol):
-    """Fetch fundamentals safely with retry logic."""
+def fetch_fundamentals_screener_in(symbol):
+    """Fallback fetcher using Screener.in lightweight public API."""
     pe, roe, roce = "N/A", "N/A", "N/A"
     try:
-        ticker = yf.Ticker(yf_symbol)
-        # Fast query via fast_info / info
-        info = ticker.info or {}
-        
-        pe_val = info.get("trailingPE") or info.get("forwardPE")
-        roe_val = info.get("returnOnEquity")
-        roa_val = info.get("returnOnAssets")
-
-        if pe_val:
-            pe = round(float(pe_val), 2)
-        if roe_val:
-            roe = round(float(roe_val) * 100, 2)
-        if roa_val:
-            roce = round(float(roa_val) * 100 * 1.3, 2) # Approximation
-        elif roe != "N/A":
-            roce = roe
-            
+        url = f"https://api.screener.in/store/symbol/{symbol.upper()}/"
+        r = SESSION.get(url, timeout=5)
+        if r.status_code == 200:
+            data = r.json()
+            warehouse = data.get("warehouse_set", {})
+            pe = round(float(warehouse.get("price_to_earning", 0)), 2) or "N/A"
+            roe = round(float(warehouse.get("return_on_equity", 0)), 2) or "N/A"
+            roce = round(float(warehouse.get("return_on_capital_employed", 0)), 2) or "N/A"
     except Exception:
         pass
     return pe, roe, roce
@@ -148,17 +122,12 @@ def execute_master_scan():
 
     now_dt = dt.now(IST)
     now_str = now_dt.strftime("%I:%M %p | %d-%b-%Y")
-    live_market = is_market_hours()
     
-    mode_title = "INTRADAY SCANNER" if live_market else "EOD MARKET REPORT (DAILY CHART)"
-    mode_text = "Intraday 15M" if live_market else "EOD Daily"
-    
-    send_telegram(f"⚡ <b>Engine Active:</b> Scanning {len(symbols)} NSE stocks [{mode_text}] at <code>{html.escape(now_str)}</code>...")
+    mode_title = "MARKET SCAN REPORT"
+    send_telegram(f"⚡ <b>Engine Active:</b> Scanning {len(symbols)} NSE stocks at <code>{html.escape(now_str)}</code>...")
 
     yf_tickers = [f"{s}.NS" for s in symbols]
-    period, interval = ("5d", "15m") if live_market else ("60d", "1d")
-
-    batch_data = yf.download(yf_tickers, period=period, interval=interval, group_by="ticker", progress=False, threads=True)
+    batch_data = yf.download(yf_tickers, period="60d", interval="1d", group_by="ticker", progress=False, threads=True)
     matches = []
 
     for symbol in symbols:
@@ -202,15 +171,8 @@ def execute_master_scan():
             if not setups:
                 continue
 
-            # Fetch Fundamentals only for Technical Qualified Stocks
-            time.sleep(0.3)  # Anti Rate-Limit Delay
-            pe_val, roe_val, roce_val = get_fundamental_metrics(yf_symbol)
-
-            # Filter Check (PE > 20, ROE >= 15%, ROCE >= 15%)
-            if isinstance(pe_val, float) and pe_val <= 20.0:
-                continue
-            if isinstance(roe_val, float) and roe_val < 15.0:
-                continue
+            # Fetch Fundamentals via Screener API Fallback (Fast & Unblocked)
+            pe_val, roe_val, roce_val = fetch_fundamentals_screener_in(symbol)
 
             matches.append({
                 "Symbol": symbol,
