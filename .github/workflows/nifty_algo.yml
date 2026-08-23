@@ -23,6 +23,19 @@ jobs:
           python -m pip install --upgrade pip
           pip install smartapi-python pandas ta pytz requests python-dotenv pyotp logzero websocket-client
 
+      - name: Auto-Clean Non-Breaking Spaces
+        run: |
+          python -c "
+          import glob
+          for filepath in glob.glob('*.py'):
+              with open(filepath, 'rb') as f:
+                  content = f.read()
+              cleaned = content.replace(b'\xc2\xa0', b' ')
+              with open(filepath, 'wb') as f:
+                  f.write(cleaned)
+          "
+          sed -i 's/\xc2\xa0/ /g' *.py || true
+
       - name: Execute Algo Script
         env:
           SMARTAPI_API_KEY: ${{ secrets.SMARTAPI_API_KEY }}
