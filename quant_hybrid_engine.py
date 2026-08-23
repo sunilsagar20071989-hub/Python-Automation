@@ -1,8 +1,9 @@
-# HYBRID QUANT SCREENER (FIXED FUNDAMENTAL FETCH)
+# HYBRID QUANT SCREENER (FIXED FUNDAMENTALS FETCH WITH RATE-LIMIT DELAY)
 from datetime import datetime as dt
 import html
 import logging
 import os
+import time
 import pytz
 import requests
 import ta
@@ -43,7 +44,7 @@ logger = logging.getLogger("FullMarketScreener")
 IST = pytz.timezone("Asia/Kolkata")
 SESSION = requests.Session()
 SESSION.headers.update({
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36"
 })
 
 MAX_STOCKS = int(os.getenv("FULL_MARKET_MAX_STOCKS", "0"))
@@ -114,6 +115,32 @@ def is_market_hours():
     return False
 
 
+def get_fundamental_metrics(yf_symbol):
+    """Fetch fundamentals safely with retry logic."""
+    pe, roe, roce = "N/A", "N/A", "N/A"
+    try:
+        ticker = yf.Ticker(yf_symbol)
+        # Fast query via fast_info / info
+        info = ticker.info or {}
+        
+        pe_val = info.get("trailingPE") or info.get("forwardPE")
+        roe_val = info.get("returnOnEquity")
+        roa_val = info.get("returnOnAssets")
+
+        if pe_val:
+            pe = round(float(pe_val), 2)
+        if roe_val:
+            roe = round(float(roe_val) * 100, 2)
+        if roa_val:
+            roce = round(float(roa_val) * 100 * 1.3, 2) # Approximation
+        elif roe != "N/A":
+            roce = roe
+            
+    except Exception:
+        pass
+    return pe, roe, roce
+
+
 def execute_master_scan():
     symbols = fetch_clean_nse_universe()
     if not symbols:
@@ -175,36 +202,15 @@ def execute_master_scan():
             if not setups:
                 continue
 
-            # Safe Fundamental Fetch (Fallback Mode)
-            pe_ratio = "N/A"
-            roe_percent = "N/A"
-            roce_percent = "N/A"
-            
-            try:
-                ticker_obj = yf.Ticker(yf_symbol)
-                info = ticker_obj.info or {}
-                
-                pe_val = info.get("trailingPE")
-                roe_raw = info.get("returnOnEquity")
-                roce_raw = info.get("returnOnAssets")
-                
-                if pe_val is not None:
-                    pe_ratio = round(pe_val, 2)
-                if roe_raw is not None:
-                    roe_percent = round(roe_raw * 100, 2)
-                if roce_raw is not None:
-                    roce_percent = round((roce_raw * 100 * 1.3), 2)
-                elif isinstance(roe_percent, float):
-                    roce_percent = roe_percent
+            # Fetch Fundamentals only for Technical Qualified Stocks
+            time.sleep(0.3)  # Anti Rate-Limit Delay
+            pe_val, roe_val, roce_val = get_fundamental_metrics(yf_symbol)
 
-                # Fundamental Filter Check (Only applied if data exists)
-                if isinstance(pe_ratio, float) and pe_ratio <= 20.0:
-                    continue
-                if isinstance(roe_percent, float) and roe_percent < 15.0:
-                    continue
-
-            except Exception:
-                pass
+            # Filter Check (PE > 20, ROE >= 15%, ROCE >= 15%)
+            if isinstance(pe_val, float) and pe_val <= 20.0:
+                continue
+            if isinstance(roe_val, float) and roe_val < 15.0:
+                continue
 
             matches.append({
                 "Symbol": symbol,
@@ -212,9 +218,9 @@ def execute_master_scan():
                 "Setups": ", ".join(setups),
                 "RSI": round(float(c["rsi"]), 1),
                 "ROC": round(float(c["roc"]), 1),
-                "PE": pe_ratio,
-                "ROE_%": roe_percent,
-                "ROCE_%": roce_percent,
+                "PE": pe_val,
+                "ROE_%": roe_val,
+                "ROCE_%": roce_val,
                 "Volume": int(c["volume"]),
             })
         except Exception:
