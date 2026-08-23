@@ -15,11 +15,6 @@ jobs:
       FULL_MARKET_MAX_STOCKS: "0"
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-      SMARTAPI_KEY: ${{ secrets.SMARTAPI_KEY }}
-      SMARTAPI_CLIENT_CODE: ${{ secrets.SMARTAPI_CLIENT_CODE }}
-      SMARTAPI_PIN: ${{ secrets.SMARTAPI_PIN }}
-      SMARTAPI_TOTP_SECRET: ${{ secrets.SMARTAPI_TOTP_SECRET }}
-      FMP_API_KEY: ${{ secrets.FMP_API_KEY }}
 
     steps:
       - name: Check out repository
