@@ -1,17 +1,3 @@
-import sys
-
-# Self-sanitize non-breaking space encoding issues
-if __name__ == "__main__":
-    try:
-        with open(__file__, "r", encoding="utf-8") as f:
-            content = f.read()
-        if "\u00a0" in content:
-            cleaned = content.replace("\u00a0", " ")
-            with open(__file__, "w", encoding="utf-8") as f:
-                f.write(cleaned)
-    except Exception:
-        pass
-
 from datetime import datetime as dt
 import html
 import logging
