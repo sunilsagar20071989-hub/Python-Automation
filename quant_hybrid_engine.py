@@ -115,10 +115,17 @@ def execute_master_scan():
     for symbol in symbols:
         try:
             yf_symbol = f"{symbol}.NS"
-            if yf_symbol in batch_data.columns.levels[0]:
-                df = batch_data[yf_symbol].copy().dropna(subset=["Close"])
+            
+            # Robust extraction of single stock dataframe from yfinance batch download
+            if isinstance(batch_data.columns, pd.MultiIndex):
+                if yf_symbol in batch_data.columns.levels[0]:
+                    df = batch_data[yf_symbol].copy()
+                else:
+                    continue
             else:
-                continue
+                df = batch_data.copy()
+
+            df = df.dropna(subset=["Close"])
                 
             if df.empty or len(df) < 20:
                 continue
