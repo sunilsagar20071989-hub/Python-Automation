@@ -30,5 +30,18 @@ jobs:
           python -m pip install --upgrade pip
           pip install pandas yfinance ta requests pytz python-dotenv openpyxl
 
+      - name: Auto-Clean Non-Breaking Spaces in Python Scripts
+        run: |
+          python -c "
+          import glob
+          for filepath in glob.glob('*.py'):
+              with open(filepath, 'rb') as f:
+                  content = f.read()
+              cleaned = content.replace(b'\xc2\xa0', b' ')
+              with open(filepath, 'wb') as f:
+                  f.write(cleaned)
+          "
+          sed -i 's/\xc2\xa0/ /g' quant_hybrid_engine.py || true
+
       - name: Execute Master Screener Engine
         run: python quant_hybrid_engine.py
