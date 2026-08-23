@@ -48,7 +48,7 @@ SESSION.headers.update({
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
 })
 
-MAX_STOCKS = int(os.getenv("FULL_MARKET_MAX_STOCKS", "300"))
+MAX_STOCKS = int(os.getenv("FULL_MARKET_MAX_STOCKS", "0"))
 
 
 def send_telegram(message):
