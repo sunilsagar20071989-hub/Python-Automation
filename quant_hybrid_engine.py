@@ -8,6 +8,7 @@ import ta
 import yfinance as yf
 import pandas as pd
 
+# Load Environment / Secrets
 try:
     from dotenv import load_dotenv
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -30,11 +31,10 @@ except ImportError:
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-FMP_API_KEY = os.getenv("FMP_API_KEY")
 
 logging.getLogger("yfinance").setLevel(logging.CRITICAL)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-logger = logging.getLogger("FullMarketScreener")
+logger = logging.getLogger("MomentumQuantScreener")
 
 IST = pytz.timezone("Asia/Kolkata")
 SESSION = requests.Session()
@@ -98,25 +98,6 @@ def fetch_clean_nse_universe():
         return []
 
 
-def fetch_fmp_fundamentals(symbol):
-    pe, roe, roce = "N/A", "N/A", "N/A"
-    if not FMP_API_KEY:
-        return pe, roe, roce
-    try:
-        url = f"https://financialmodelingprep.com/api/v3/ratios/{symbol}.NS?apikey={FMP_API_KEY}"
-        r = SESSION.get(url, timeout=5)
-        if r.status_code == 200:
-            data = r.json()
-            if data and isinstance(data, list):
-                latest = data[0]
-                pe = round(float(latest.get("priceEarningsRatio", 0)), 2) or "N/A"
-                roe = round(float(latest.get("returnOnEquity", 0)) * 100, 2) or "N/A"
-                roce = round(float(latest.get("returnOnCapitalEmployed", 0)) * 100, 2) or "N/A"
-    except Exception:
-        pass
-    return pe, roe, roce
-
-
 def execute_master_scan():
     symbols = fetch_clean_nse_universe()
     if not symbols:
@@ -144,9 +125,11 @@ def execute_master_scan():
 
             df.columns = [c.lower() for c in df.columns]
 
+            # Liquidity Filter: 20-day Average Volume > 3000
             if df["volume"].tail(20).mean() < 3000:
                 continue
 
+            # Core Technical Setup Calculations
             df["rsi"] = ta.momentum.rsi(df["close"], window=14)
             df["roc"] = ta.momentum.roc(df["close"], window=12)
             df["ema_9"] = ta.trend.ema_indicator(df["close"], window=9)
@@ -161,47 +144,45 @@ def execute_master_scan():
             setups = []
             vol_sma_val = float(c["vol_sma"]) if pd.notna(c["vol_sma"]) and float(c["vol_sma"]) > 0 else 1.0
 
+            # Signal 1: High Conviction Breakout
             if c["close"] > p["high"] and c["volume"] >= 1.2 * vol_sma_val and c["rsi"] >= 60.0:
                 setups.append("🔥 High Conviction Breakout")
+            # Signal 2: Early Momentum Buildup
             elif c["close"] > p["high"] and c["rsi"] >= 58.0:
                 setups.append("📈 Early Momentum Buildup")
 
+            # Signal 3: Bullish EMA Crossover
             if p["ema_9"] <= p["ema_21"] and c["ema_9"] > c["ema_21"] and c["rsi"] >= 55.0:
                 setups.append("⚡ Bullish EMA Crossover")
                 
             if not setups:
                 continue
 
-            pe_val, roe_val, roce_val = fetch_fmp_fundamentals(symbol)
-
             matches.append({
                 "Symbol": symbol,
                 "LTP": round(float(c["close"]), 2),
                 "Setups": ", ".join(setups),
                 "RSI": round(float(c["rsi"]), 1),
-                "ROC": round(float(c["roc"]), 1),
-                "PE": pe_val,
-                "ROE_%": roe_val,
-                "ROCE_%": roce_val,
+                "ROC_%": round(float(c["roc"]), 1),
                 "Volume": int(c["volume"]),
             })
         except Exception:
             continue
 
     if matches:
-        lines = [f"📊 <b>MARKET SCAN REPORT</b>\n<code>{html.escape(now_str)}</code>\n"]
+        lines = [f"📊 <b>MOMENTUM SCAN REPORT</b>\n<code>{html.escape(now_str)}</code>\n"]
         for m in matches:
             lines.append(
                 f"<b>Stock:</b> {html.escape(m['Symbol'])} | <b>LTP:</b> ₹{m['LTP']}\n"
                 f"<b>Signal:</b> {html.escape(m['Setups'])}\n"
-                f"<b>RSI:</b> {m['RSI']} | <b>ROC:</b> {m['ROC']}% | <b>PE:</b> {m['PE']} | <b>ROE:</b> {m['ROE_%']}% | <b>ROCE:</b> {m['ROCE_%']}%\n"
+                f"<b>RSI:</b> {m['RSI']} | <b>ROC:</b> {m['ROC_%']}% | <b>Vol:</b> {m['Volume']:,}\n"
                 f"-----------------------------------"
             )
         send_telegram("\n".join(lines))
         
         excel_filename = f"Quant_Screener_{now_dt.strftime('%Y%m%d_%H%M%S')}.xlsx"
         report_df = pd.DataFrame(matches)
-        report_df = report_df[["Symbol", "LTP", "Setups", "RSI", "ROC", "PE", "ROE_%", "ROCE_%", "Volume"]]
+        report_df = report_df[["Symbol", "LTP", "Setups", "RSI", "ROC_%", "Volume"]]
         report_df.to_excel(excel_filename, index=False)
         
         send_telegram_document(excel_filename, caption=f"📁 <b>Excel Report:</b> ({now_str})")
