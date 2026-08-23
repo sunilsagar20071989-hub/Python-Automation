@@ -44,16 +44,7 @@ jobs:
           "
           sed -i 's/\xc2\xa0/ /g' *.py || true
 
-      - name: Run Hybrid Quant Screener
-        env:
-          FULL_MARKET_MAX_STOCKS: "0"
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          TZ: "Asia/Kolkata"
-        run: python quant_hybrid_engine.py
-
       - name: Run FnO Option 15Min Screener
-        if: always()
         env:
           SMARTAPI_API_KEY: ${{ secrets.SMARTAPI_API_KEY }}
           SMARTAPI_CLIENT_CODE: ${{ secrets.SMARTAPI_CLIENT_CODE }}
