@@ -82,6 +82,9 @@ active_quantity = NIFTY_LOT_SIZE
 trade_entry_time = None
 
 daily_trades_count = 0
+consecutive_sl_count = 0
+consecutive_win_count = 0
+
 scrip_master_df = None
 auth_token = ""
 feed_token = ""
@@ -554,98 +557,6 @@ def main():
 if __name__ == "__main__":
     main()
 
-import os
-import sys
-import time
-import json
-import logging
-from datetime import datetime, time as dtime
-import pytz
-import requests
-import pyotp
-import pandas as pd
-import ta
-from SmartApi import SmartConnect
-
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except ImportError:
-    pass
-
-# ==========================================
-# LOGGING CONFIGURATION
-# ==========================================
-logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
-)
-logger = logging.getLogger("NiftyAlgo")
-
-# ==========================================
-# 1. PARAMETERS & CONFIGURATION
-# ==========================================
-API_KEY = (
-    os.getenv("SMARTAPI_API_KEY")
-    or os.getenv("SMARTAPI_KEY")
-    or os.getenv("API_KEY")
-)
-CLIENT_CODE = (
-    os.getenv("SMARTAPI_CLIENT_CODE")
-    or os.getenv("CLIENT_CODE")
-    or os.getenv("CLIENT_ID")
-)
-PIN = os.getenv("SMARTAPI_PIN") or os.getenv("PIN")
-TOTP_SECRET = os.getenv("SMARTAPI_TOTP_SECRET") or os.getenv("TOTP_SECRET")
-
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-
-DEFAULT_TOTAL_CAPITAL = 100000.0
-
-SL_PCT = 0.045
-TARGET_PCT = 0.25
-MAX_RISK_PER_TRADE_PCT = 0.015
-NIFTY_LOT_SIZE = 65
-
-ENABLE_TRAILING_SL = True
-TSL_ACTIVATION_PCT = 0.04
-TSL_STEP_TRIGGER_PCT = 0.02
-TSL_STEP_MOVE_PCT = 0.015
-
-MIN_VIX = 10.0
-MAX_VIX = 24.0
-ITM_STRIKE_OFFSET = 50
-
-NIFTY_TOKEN = "99926000"
-INDIA_VIX_TOKEN = "99926009"
-
-MAX_DAILY_TRADES = 4
-MAX_HOLDING_MINUTES = 22
-SCAN_INTERVAL_SECONDS = 15
-
-# Global State Variables
-pos_active = False
-algo_paused = False
-active_symbol = ""
-active_token = ""
-entry_price = 0.0
-sl_price = 0.0
-tgt_price = 0.0
-highest_price_seen = 0.0
-tsl_activated = False
-active_quantity = NIFTY_LOT_SIZE
-trade_entry_time = None
-
-daily_trades_count = 0
-consecutive_sl_count = 0
-consecutive_win_count = 0
-
-scrip_master_df = None
-auth_token = ""
-feed_token = ""
-smartApi = None
-LOG_FILE = "trade_log.csv"
-
 
 # ==========================================
 # 2. HELPER & TIME FUNCTIONS
@@ -688,7 +599,8 @@ def send_telegram_alert(message, max_retries=3):
             res = requests.post(url, data=payload, timeout=5)
             if res.status_code == 200:
                 return
-        except Exception:
+        except Exception as e:
+            logger.warning(f"Telegram alert retry failed: {e}")
             time.sleep(1)
 
 
@@ -782,7 +694,7 @@ def place_order(symbol, token, buy_sell_type, quantity, exchange="NFO"):
             if response and response.get("status") and "data" in response:
                 return response["data"]["orderid"]
     except Exception as e:
-        logger.error(f"Order Placement Error: {e}")
+        logger.error(f"Order Placement Error for {symbol}: {e}")
     return None
 
 
@@ -817,7 +729,8 @@ def calculate_dynamic_quantity(option_price):
             )
 
         return total_qty
-    except Exception:
+    except Exception as e:
+        logger.error(f"Error calculating dynamic quantity: {e}")
         return NIFTY_LOT_SIZE
 
 
@@ -829,8 +742,8 @@ def get_live_ltp(token, symbol, exchange="NFO"):
         ltp_data = smartApi.ltpData(exchange, symbol, str(token))
         if ltp_data and ltp_data.get("status") and "data" in ltp_data:
             return float(ltp_data["data"]["ltp"])
-    except Exception:
-        pass
+    except Exception as e:
+        logger.error(f"LTP fetch error for {symbol}: {e}")
     return None
 
 
@@ -874,8 +787,8 @@ def get_itm_option_scrip(spot_price, option_type="CE"):
         if not valid_df.empty:
             selected = valid_df.iloc[0]
             return selected["symbol"], str(selected["token"])
-    except Exception:
-        pass
+    except Exception as e:
+        logger.error(f"Error resolving option scrip: {e}")
     return None, None
 
 
@@ -905,9 +818,9 @@ def fetch_nifty_candles(interval="FIVE_MINUTE"):
             df["roc"] = ta.momentum.roc(df["close"], window=9)
             df["ema_9"] = ta.trend.ema_indicator(df["close"], window=9)
             df["ema_21"] = ta.trend.ema_indicator(df["close"], window=21)
-            return df
-    except Exception:
-        pass
+            return df.dropna().reset_index(drop=True)
+    except Exception as e:
+        logger.error(f"Candle data fetch error: {e}")
     return None
 
 
@@ -920,6 +833,7 @@ def get_15m_trend():
 
 
 def get_option_chain_pcr_and_levels(spot_price):
+    # TODO: Connect live option chain API feed if PCR validation is strictly required
     return 1.0, spot_price + 100, spot_price - 100
 
 
@@ -1191,15 +1105,3 @@ if __name__ == "__main__":
 
     logger.info("Market hours finished. Stopping engine.")
     sys.exit(0)
-
-# Nifty script ke main() function ke andar replace karein:
-tg_msg = (
-    f"📁 <b>FILE: nifty_screener.py</b>\n"  # <-- Apni Nifty file ka exact naam yahan likhein
-    f"📊 <b>NIFTY BREAKOUT / SETUP ALERT</b>\n\n"
-    f"<b>Symbol:</b> NIFTY\n"
-    f"<b>LTP:</b> ₹{item['LTP']}\n"
-    f"<b>Change:</b> {item['Change%']}%\n"
-    f"<b>RSI:</b> {item['RSI']}\n"
-    f"<b>Signal:</b> {item['Signal']}"
-)
-send_telegram_alert(tg_msg)
