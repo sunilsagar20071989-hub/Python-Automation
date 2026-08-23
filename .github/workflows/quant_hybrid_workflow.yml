@@ -2,29 +2,24 @@ name: Hybrid Quant Screener Engine
 
 on:
   schedule:
-    # Market Hours (IST) Cron Schedule
-    - cron: '35 3 * * 1-5'  # 9:05 AM IST (Mon-Fri)
-    - cron: '0 4 * * 1-5'   # 9:30 AM IST (Mon-Fri)
-    - cron: '0 10 * * 1-5'  # 3:30 PM IST (Mon-Fri EOD)
-  workflow_dispatch:        # Manual Run Button
+    - cron: '35 3 * * 1-5'  # 9:05 AM IST
+    - cron: '0 4 * * 1-5'   # 9:30 AM IST
+    - cron: '0 10 * * 1-5'  # 3:30 PM IST
+  workflow_dispatch:
 
 jobs:
   run-screener:
     runs-on: ubuntu-latest
 
     env:
-      # FULL MARKET SCAN (0 = Unlimited / All 2600+ NSE Stocks)
       FULL_MARKET_MAX_STOCKS: "0"
-      
-      # Telegram Credentials
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-      
-      # Angel One Credentials
       SMARTAPI_KEY: ${{ secrets.SMARTAPI_KEY }}
       SMARTAPI_CLIENT_CODE: ${{ secrets.SMARTAPI_CLIENT_CODE }}
       SMARTAPI_PIN: ${{ secrets.SMARTAPI_PIN }}
       SMARTAPI_TOTP_SECRET: ${{ secrets.SMARTAPI_TOTP_SECRET }}
+      FMP_API_KEY: ${{ secrets.FMP_API_KEY }}
 
     steps:
       - name: Check out repository
