@@ -28,10 +28,32 @@ jobs:
       - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pandas requests pyotp smartapi-python python-dotenv ta logzero websocket-client
+          pip install pandas yfinance ta requests pytz python-dotenv openpyxl pyotp smartapi-python logzero websocket-client
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
+      - name: Auto-Clean Non-Breaking Spaces
+        run: |
+          python -c "
+          import glob
+          for filepath in glob.glob('*.py'):
+              with open(filepath, 'rb') as f:
+                  content = f.read()
+              cleaned = content.replace(b'\xc2\xa0', b' ')
+              with open(filepath, 'wb') as f:
+                  f.write(cleaned)
+          "
+          sed -i 's/\xc2\xa0/ /g' *.py || true
+
+      - name: Run Hybrid Quant Screener
+        env:
+          FULL_MARKET_MAX_STOCKS: "0"
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TZ: "Asia/Kolkata"
+        run: python quant_hybrid_engine.py
+
       - name: Run FnO Option 15Min Screener
+        if: always()
         env:
           SMARTAPI_API_KEY: ${{ secrets.SMARTAPI_API_KEY }}
           SMARTAPI_CLIENT_CODE: ${{ secrets.SMARTAPI_CLIENT_CODE }}
@@ -43,7 +65,7 @@ jobs:
         run: python fno_option_15min_screener.py
 
       - name: Run Advanced Stock Screener
-        if: always() # Runs even if previous step fails
+        if: always()
         env:
           SMARTAPI_API_KEY: ${{ secrets.SMARTAPI_API_KEY }}
           SMARTAPI_CLIENT_CODE: ${{ secrets.SMARTAPI_CLIENT_CODE }}
@@ -55,7 +77,7 @@ jobs:
         run: python advanced_stock_screener.py
 
       - name: Run Intraday Screener
-        if: always() # Runs even if previous step fails
+        if: always()
         env:
           SMARTAPI_API_KEY: ${{ secrets.SMARTAPI_API_KEY }}
           SMARTAPI_CLIENT_CODE: ${{ secrets.SMARTAPI_CLIENT_CODE }}
