@@ -1,4 +1,4 @@
-# HYBRID QUANT SCREENER (INTRADAY + EOD MARKET SCANNER)
+# HYBRID QUANT SCREENER (SECURE ENV LOAD)
 from datetime import datetime as dt
 import html
 import logging
@@ -8,13 +8,19 @@ import requests
 import ta
 import yfinance as yf
 import pandas as pd
+from dotenv import load_dotenv
+
+load_dotenv()
+API_KEY = os.getenv("SMARTAPI_KEY") or os.getenv("SMARTAPI_API_KEY")
+CLIENT_CODE = os.getenv("SMARTAPI_CLIENT_CODE")
+PIN = os.getenv("SMARTAPI_PIN")
+TOTP_SECRET = os.getenv("SMARTAPI_TOTP_SECRET")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 logging.getLogger("yfinance").setLevel(logging.CRITICAL)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("FullMarketScreener")
-
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 IST = pytz.timezone("Asia/Kolkata")
 SESSION = requests.Session()
@@ -27,7 +33,7 @@ MAX_STOCKS = int(os.getenv("FULL_MARKET_MAX_STOCKS", "300"))
 
 def send_telegram(message):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        logger.warning("Telegram credentials missing.")
+        logger.warning("Telegram credentials missing or invalid.")
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     chunks = [message[i : i + 3500] for i in range(0, len(message), 3500)] or [""]
@@ -69,7 +75,6 @@ def fetch_clean_nse_universe():
 
 def is_market_hours():
     now = dt.now(IST)
-    # Mon-Fri between 9:15 AM and 3:30 PM
     if now.weekday() < 5:
         start = now.replace(hour=9, minute=15, second=0, microsecond=0)
         end = now.replace(hour=15, minute=30, second=0, microsecond=0)
@@ -82,17 +87,17 @@ def execute_master_scan():
     if not symbols:
         return
 
-    yf_tickers = [f"{s}.NS" for s in symbols]
-    
-    # Auto-detect Market Time vs After Market Hours
+    now_str = dt.now(IST).strftime("%I:%M %p | %d-%b-%Y")
     live_market = is_market_hours()
     
-    if live_market:
-        logger.info("Live Market Detected: Running 15M Intraday Scan...")
-        period, interval = "5d", "15m"
-    else:
-        logger.info("After Market Closed: Running Daily (1D) EOD Scan...")
-        period, interval = "60d", "1d"
+    mode_title = "INTRADAY SCANNER" if live_market else "EOD MARKET REPORT (DAILY CHART)"
+    mode_text = "Intraday 15M" if live_market else "EOD Daily"
+    
+    # Heartbeat
+    send_telegram(f"⚡ <b>Engine Active:</b> Scanning {len(symbols)} NSE stocks [{mode_text}] at <code>{html.escape(now_str)}</code>...")
+
+    yf_tickers = [f"{s}.NS" for s in symbols]
+    period, interval = ("5d", "15m") if live_market else ("60d", "1d")
 
     batch_data = yf.download(yf_tickers, period=period, interval=interval, group_by="ticker", progress=False, threads=True)
     matches = []
@@ -110,10 +115,9 @@ def execute_master_scan():
 
             df.columns = [c.lower() for c in df.columns]
 
-            if df["volume"].tail(20).mean() < 5000:
+            if df["volume"].tail(20).mean() < 3000:
                 continue
 
-            # Indicators
             df["rsi"] = ta.momentum.rsi(df["close"], window=14)
             df["roc"] = ta.momentum.roc(df["close"], window=12)
             df["ema_9"] = ta.trend.ema_indicator(df["close"], window=9)
@@ -128,11 +132,13 @@ def execute_master_scan():
             setups = []
             vol_sma_val = float(c["vol_sma"]) if pd.notna(c["vol_sma"]) and float(c["vol_sma"]) > 0 else 1.0
 
-            # Momentum Criteria
             if c["close"] > p["high"] and c["volume"] >= 1.2 * vol_sma_val and c["rsi"] >= 60.0:
-                setups.append("Price & Vol Breakout")
+                setups.append("🔥 High Conviction Breakout")
+            elif c["close"] > p["high"] and c["rsi"] >= 58.0:
+                setups.append("📈 Early Momentum Buildup")
+
             if p["ema_9"] <= p["ema_21"] and c["ema_9"] > c["ema_21"] and c["rsi"] >= 55.0:
-                setups.append("Bullish EMA Crossover")
+                setups.append("⚡ Bullish EMA Crossover")
                 
             if not setups:
                 continue
@@ -147,9 +153,6 @@ def execute_master_scan():
         except Exception:
             continue
 
-    now_str = dt.now(IST).strftime("%I:%M %p | %d-%b-%Y")
-    mode_title = "INTRADAY SCANNER" if live_market else "EOD MARKET REPORT (DAILY CHART)"
-    
     if matches:
         lines = [f"📊 <b>{mode_title}</b>\n<code>{html.escape(now_str)}</code>\n"]
         for m in matches:
@@ -161,7 +164,7 @@ def execute_master_scan():
             )
         send_telegram("\n".join(lines))
     else:
-        send_telegram(f"📊 <b>{mode_title}:</b> Scanned {len(symbols)} stocks. No stock matched parameters.")
+        send_telegram(f"📊 <b>{mode_title}:</b> Scanned {len(symbols)} stocks. No stock matched setup parameters.")
 
 
 if __name__ == "__main__":
