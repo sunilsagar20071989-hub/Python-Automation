@@ -1,41 +1,44 @@
-name: Quant Hybrid Screener Run
+name: Hybrid Quant Screener Engine
 
 on:
   schedule:
-    # Mon-Fri 9:15 AM to 3:30 PM IST
-    - cron: '15,30,45,0 4-9 * * 1-5'
-  workflow_dispatch:
-
-concurrency:
-  group: smartapi-screener
-  cancel-in-progress: true
+    # Market Hours (IST) par auto-trigger ke liye Cron Schedule
+    - cron: '35 3 * * 1-5'  # 9:05 AM IST (Mon-Fri)
+    - cron: '0 4 * * 1-5'   # 9:30 AM IST (Mon-Fri)
+    - cron: '0 10 * * 1-5'  # 3:30 PM IST (Mon-Fri EOD)
+  workflow_dispatch:        # Manual Run Button enabling
 
 jobs:
   run-screener:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+
+    env:
+      # FULL MARKET SCAN (0 = Unlimited / All 1800+ NSE Stocks)
+      FULL_MARKET_MAX_STOCKS: "0"
+      
+      # Telegram Credentials
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      
+      # Angel One Credentials
+      SMARTAPI_KEY: ${{ secrets.SMARTAPI_KEY }}
+      SMARTAPI_CLIENT_CODE: ${{ secrets.SMARTAPI_CLIENT_CODE }}
+      SMARTAPI_PIN: ${{ secrets.SMARTAPI_PIN }}
+      SMARTAPI_TOTP_SECRET: ${{ secrets.SMARTAPI_TOTP_SECRET }}
 
     steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4.2.2
+      - name: Check out repository
+        uses: actions/checkout@v4
 
       - name: Set up Python
-        uses: actions/setup-python@v5.3.0
+        uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: '3.10'
 
       - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install yfinance pandas ta beautifulsoup4 requests pyotp pytz logzero websocket-client smartapi-python python-dotenv openpyxl
+          pip install pandas yfinance ta requests pytz python-dotenv openpyxl
 
-      - name: Execute Screener
-        env:
-          SMARTAPI_API_KEY: ${{ secrets.SMARTAPI_API_KEY }}
-          SMARTAPI_CLIENT_CODE: ${{ secrets.SMARTAPI_CLIENT_CODE }}
-          SMARTAPI_PIN: ${{ secrets.SMARTAPI_PIN }}
-          SMARTAPI_TOTP_SECRET: ${{ secrets.SMARTAPI_TOTP_SECRET }}
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          FULL_MARKET_MAX_STOCKS: "300"
+      - name: Execute Master Screener Engine
         run: python quant_hybrid_engine.py
