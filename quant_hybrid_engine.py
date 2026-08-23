@@ -1,4 +1,4 @@
-# HYBRID QUANT SCREENER (WORKING FUNDAMENTALS FIX)
+# HYBRID QUANT SCREENER (STABLE FUNDAMENTALS WITH FMP API)
 from datetime import datetime as dt
 import html
 import logging
@@ -31,6 +31,7 @@ except ImportError:
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+FMP_API_KEY = os.getenv("FMP_API_KEY")
 
 logging.getLogger("yfinance").setLevel(logging.CRITICAL)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -39,7 +40,7 @@ logger = logging.getLogger("FullMarketScreener")
 IST = pytz.timezone("Asia/Kolkata")
 SESSION = requests.Session()
 SESSION.headers.update({
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
 })
 
 MAX_STOCKS = int(os.getenv("FULL_MARKET_MAX_STOCKS", "0"))
@@ -98,18 +99,20 @@ def fetch_clean_nse_universe():
         return []
 
 
-def fetch_fundamentals_screener_in(symbol):
-    """Fallback fetcher using Screener.in lightweight public API."""
+def fetch_fmp_fundamentals(symbol):
     pe, roe, roce = "N/A", "N/A", "N/A"
+    if not FMP_API_KEY:
+        return pe, roe, roce
     try:
-        url = f"https://api.screener.in/store/symbol/{symbol.upper()}/"
+        url = f"https://financialmodelingprep.com/api/v3/ratios/{symbol}.NS?apikey={FMP_API_KEY}"
         r = SESSION.get(url, timeout=5)
         if r.status_code == 200:
             data = r.json()
-            warehouse = data.get("warehouse_set", {})
-            pe = round(float(warehouse.get("price_to_earning", 0)), 2) or "N/A"
-            roe = round(float(warehouse.get("return_on_equity", 0)), 2) or "N/A"
-            roce = round(float(warehouse.get("return_on_capital_employed", 0)), 2) or "N/A"
+            if data and isinstance(data, list):
+                latest = data[0]
+                pe = round(float(latest.get("priceEarningsRatio", 0)), 2) or "N/A"
+                roe = round(float(latest.get("returnOnEquity", 0)) * 100, 2) or "N/A"
+                roce = round(float(latest.get("returnOnCapitalEmployed", 0)) * 100, 2) or "N/A"
     except Exception:
         pass
     return pe, roe, roce
@@ -123,7 +126,6 @@ def execute_master_scan():
     now_dt = dt.now(IST)
     now_str = now_dt.strftime("%I:%M %p | %d-%b-%Y")
     
-    mode_title = "MARKET SCAN REPORT"
     send_telegram(f"⚡ <b>Engine Active:</b> Scanning {len(symbols)} NSE stocks at <code>{html.escape(now_str)}</code>...")
 
     yf_tickers = [f"{s}.NS" for s in symbols]
@@ -171,8 +173,7 @@ def execute_master_scan():
             if not setups:
                 continue
 
-            # Fetch Fundamentals via Screener API Fallback (Fast & Unblocked)
-            pe_val, roe_val, roce_val = fetch_fundamentals_screener_in(symbol)
+            pe_val, roe_val, roce_val = fetch_fmp_fundamentals(symbol)
 
             matches.append({
                 "Symbol": symbol,
@@ -189,7 +190,7 @@ def execute_master_scan():
             continue
 
     if matches:
-        lines = [f"📊 <b>{mode_title}</b>\n<code>{html.escape(now_str)}</code>\n"]
+        lines = [f"📊 <b>MARKET SCAN REPORT</b>\n<code>{html.escape(now_str)}</code>\n"]
         for m in matches:
             lines.append(
                 f"<b>Stock:</b> {html.escape(m['Symbol'])} | <b>LTP:</b> ₹{m['LTP']}\n"
@@ -204,12 +205,10 @@ def execute_master_scan():
         report_df = report_df[["Symbol", "LTP", "Setups", "RSI", "ROC", "PE", "ROE_%", "ROCE_%", "Volume"]]
         report_df.to_excel(excel_filename, index=False)
         
-        send_telegram_document(excel_filename, caption=f"📁 <b>Excel Report:</b> {mode_title} ({now_str})")
+        send_telegram_document(excel_filename, caption=f"📁 <b>Excel Report:</b> ({now_str})")
         
         if os.path.exists(excel_filename):
             os.remove(excel_filename)
-    else:
-        send_telegram(f"📊 <b>{mode_title}:</b> Scanned {len(symbols)} stocks. No stock matched setup parameters.")
 
 
 if __name__ == "__main__":
