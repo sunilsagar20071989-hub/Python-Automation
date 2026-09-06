@@ -3,11 +3,12 @@ name: Run Nifty Algo
 on:
   workflow_dispatch: # Manual trigger
   schedule:
-    - cron: '40 3 * * 1-5' # Runs at 09:10 AM IST (Mon-Fri)
+    - cron: '44 3 * * 1-5' # Runs at 09:14 AM IST (Mon-Fri)
 
 jobs:
   run-algo:
     runs-on: ubuntu-latest
+    timeout-minutes: 370 # 6 Hours execution limit to save GitHub Actions free minutes
 
     steps:
       - name: Checkout Repository
