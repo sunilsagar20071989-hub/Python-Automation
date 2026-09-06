@@ -27,8 +27,11 @@ logging.basicConfig(
 logger = logging.getLogger("NiftyAlgo")
 
 # ==========================================
-# 1. PARAMETERS & CREDENTIALS
+# 1. HYBRID CONFIG & PARAMETERS
 # ==========================================
+# Set True for Hybrid Mode (Place API order to log in Order Book + Run Virtual Tracking)
+PAPER_TRADING = True  
+
 API_KEY = (
     os.getenv("SMARTAPI_API_KEY")
     or os.getenv("SMARTAPI_KEY")
@@ -114,10 +117,14 @@ def send_telegram_alert(message, max_retries=3):
         return
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
+    
+    prefix = "📄 [PAPER TRADE] " if PAPER_TRADING else "⚡ [REAL TRADE] "
+    full_message = f"{prefix}{message}"
+    
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
-        "text": message,
+        "text": full_message,
         "parse_mode": "HTML",
     }
     for attempt in range(max_retries):
@@ -135,6 +142,7 @@ def log_trade(symbol, trade_type, entry_p, exit_p, qty, reason):
     )
     log_data = {
         "Timestamp": get_ist_now().strftime("%Y-%m-%d %H:%M:%S"),
+        "Mode": "PAPER" if PAPER_TRADING else "LIVE",
         "Symbol": symbol,
         "Type": trade_type,
         "Entry_Price": entry_p,
@@ -147,10 +155,10 @@ def log_trade(symbol, trade_type, entry_p, exit_p, qty, reason):
     df_log = pd.DataFrame([log_data])
     file_exists = os.path.isfile(LOG_FILE)
     df_log.to_csv(LOG_FILE, mode="a", header=not file_exists, index=False)
-    logger.info(f"[TRADE LOGGED] PnL: ₹{pnl} ({pnl_pct}%) | Exit: {reason}")
+    logger.info(f"[{'PAPER' if PAPER_TRADING else 'LIVE'} LOGGED] PnL: ₹{pnl} ({pnl_pct}%) | Exit: {reason}")
 
 # ==========================================
-# 4. SMARTAPI AUTHENTICATION & EXECUTION
+# 4. SMARTAPI AUTHENTICATION & EXECUTION ENGINE
 # ==========================================
 def initialize_smartapi():
     global smartApi, auth_token, feed_token, scrip_master_df
@@ -205,20 +213,30 @@ def place_order(symbol, token, buy_sell_type, quantity, exchange="NFO"):
             "price": "0",
             "quantity": str(quantity),
         }
+        
+        # SmartAPI Order Placement (Creates entry in Angel One Order Book)
+        order_id = "VIRTUAL_ORDER"
         if smartApi is not None:
             response = smartApi.placeOrder(order_params)
             if response and response.get("status") and "data" in response:
                 order_id = response["data"]["orderid"]
-                send_telegram_alert(
-                    f"⚡ <b>AUTO-TRADE EXECUTED</b> ⚡\n"
-                    f"<b>Symbol:</b> {symbol}\n"
-                    f"<b>Type:</b> {buy_sell_type}\n"
-                    f"<b>Qty:</b> {quantity}\n"
-                    f"<b>Order ID:</b> {order_id}"
-                )
-                return order_id
+            else:
+                logger.warning(f"Angel One Order Attempted but rejected/failed. Continuing virtual tracking.")
+                order_id = "REJECTED_ORDER_BOOK"
+
+        send_telegram_alert(
+            f"<b>ORDER SENT TO BROKER</b>\n"
+            f"<b>Symbol:</b> {symbol}\n"
+            f"<b>Type:</b> {buy_sell_type}\n"
+            f"<b>Qty:</b> {quantity}\n"
+            f"<b>Order ID/Status:</b> {order_id}"
+        )
+        return order_id
     except Exception as e:
         logger.error(f"[ORDER EXCEPTION]: {e}")
+        # Even if broker API fails, return a synthetic ID for paper tracking
+        if PAPER_TRADING:
+            return "VIRTUAL_ORDER_EXCEPTION"
     return None
 
 def calculate_dynamic_quantity(option_price):
@@ -559,7 +577,7 @@ def run_trading_cycle():
                                     tsl_activated = False
                                     trade_entry_time = get_ist_now()
                                     send_telegram_alert(
-                                        f"🚀 <b>NEW AUTO-TRADE ENTERED ({signal})</b>\n"
+                                        f"🚀 <b>NEW TRADE ENTERED ({signal})</b>\n"
                                         f"<b>Symbol:</b> {sym}\n"
                                         f"<b>Entry Price:</b> ₹{entry_price:.2f}\n"
                                         f"<b>SL:</b> ₹{sl_price:.2f}\n"
@@ -577,7 +595,7 @@ if __name__ == "__main__":
         send_telegram_alert("ℹ️ <b>Nifty Algo:</b> Market Closed. Workflow finished successfully.")
         sys.exit(0)
         
-    logger.info("⚡ Engine active: Running live Market Scans...")
+    logger.info(f"⚡ Engine active ({'PAPER TRADING' if PAPER_TRADING else 'LIVE TRADING'}): Running live Market Scans...")
     send_telegram_alert("🚀 <b>Nifty Option Algo Active!</b>\nEngine listening for signals...")
     
     while is_market_open():
