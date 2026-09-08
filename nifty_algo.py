@@ -51,7 +51,7 @@ ITM_STRIKE_OFFSET = 50
 NIFTY_TOKEN = "99926000"
 MAX_DAILY_TRADES = 4
 MAX_HOLDING_MINUTES = 22
-SCAN_INTERVAL_SECONDS = 15
+SCAN_INTERVAL_SECONDS = 20  # Increased interval to prevent rate limit hits
 
 # Global State Tracking
 pos_active = False
@@ -347,10 +347,10 @@ def get_itm_option_scrip(spot_price, option_type="CE"):
 
 
 def fetch_nifty_candles(interval="FIVE_MINUTE"):
-    """Fetch candle data with rate-limit protection and backoff retries."""
+    """Fetch candle data with increased delay to completely bypass SmartAPI rate limits."""
     for attempt in range(2):
         try:
-            time.sleep(2.5)  # Enforce 2.5s delay to completely bypass SmartAPI Access Rate limits
+            time.sleep(3.0)  # Safe delay to satisfy SmartAPI rate limits
             now = get_ist_now()
             to_date = now.strftime("%Y-%m-%d %H:%M")
             from_date = (now - pd.Timedelta(days=5)).strftime("%Y-%m-%d 09:15")
@@ -379,7 +379,7 @@ def fetch_nifty_candles(interval="FIVE_MINUTE"):
 
         except Exception as e:
             logger.error(f"Candle Data Attempt {attempt+1} Failed: {e}")
-            time.sleep(3)
+            time.sleep(4)
 
     return None
 
@@ -586,13 +586,15 @@ if __name__ == "__main__":
     )
     send_telegram_alert("🚀 <b>Nifty Option Algo Active!</b>\nEngine listening for signals...")
 
+    time.sleep(3)  # Cooldown before the first scan cycle
+
     while is_market_open():
         try:
             run_trading_cycle()
             time.sleep(2 if pos_active else SCAN_INTERVAL_SECONDS)
         except Exception as main_e:
             logger.error(f"Main Engine Exception: {main_e}")
-            time.sleep(3)
+            time.sleep(5)
 
     logger.info("Market hours finished. Stopping engine.")
     sys.exit(0)
