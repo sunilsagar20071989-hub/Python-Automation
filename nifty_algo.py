@@ -51,7 +51,7 @@ ITM_STRIKE_OFFSET = 50
 NIFTY_TOKEN = "99926000"
 MAX_DAILY_TRADES = 4
 MAX_HOLDING_MINUTES = 22
-SCAN_INTERVAL_SECONDS = 20  # Increased interval to prevent rate limit hits
+SCAN_INTERVAL_SECONDS = 25  # Safe interval between scans
 
 # Global State Tracking
 pos_active = False
@@ -74,9 +74,8 @@ feed_token = ""
 smartApi = None
 LOG_FILE = "trade_log.csv"
 
-# Trend Cache to prevent excessive API Rate Limit hits
-cached_15m_trend = "NEUTRAL"
-last_15m_fetch_time = None
+# Global rate limit tracker
+last_api_call_timestamp = 0
 
 
 # ==========================================
@@ -98,6 +97,15 @@ def is_new_entry_allowed():
 
 def is_squareoff_time():
     return get_ist_now().time() >= dtime(15, 10)
+
+
+def rate_limit_cooldown(seconds=3.0):
+    """Enforces strict cooldown between consecutive SmartAPI calls."""
+    global last_api_call_timestamp
+    elapsed = time.time() - last_api_call_timestamp
+    if elapsed < seconds:
+        time.sleep(seconds - elapsed)
+    last_api_call_timestamp = time.time()
 
 
 # ==========================================
@@ -196,6 +204,7 @@ def place_order(symbol, token, buy_sell_type, quantity, exchange="NFO"):
             logger.info(f"[VIRTUAL ORDER] Executed {buy_sell_type} for {symbol} | Qty: {quantity}")
             return "VIRTUAL_ORDER_123"
 
+        rate_limit_cooldown(1.5)
         order_params = {
             "variety": "NORMAL",
             "tradingsymbol": str(symbol),
@@ -235,6 +244,7 @@ def calculate_dynamic_quantity(option_price):
     try:
         if option_price <= 0:
             return NIFTY_LOT_SIZE
+        rate_limit_cooldown(1.5)
         rms_data = smartApi.rmsLimit()
         net_capital = DEFAULT_TOTAL_CAPITAL
         if rms_data and rms_data.get("status") and "data" in rms_data:
@@ -266,7 +276,7 @@ def calculate_dynamic_quantity(option_price):
 # ==========================================
 def get_live_ltp(token, symbol, exchange="NFO"):
     try:
-        time.sleep(0.5)  # Enforced delay between REST calls
+        rate_limit_cooldown(1.5)
         ltp_data = smartApi.ltpData(exchange, symbol, str(token))
         if ltp_data and ltp_data.get("status") and "data" in ltp_data:
             return float(ltp_data["data"]["ltp"])
@@ -280,7 +290,6 @@ def get_nifty_spot_ltp():
 
 
 def get_india_vix():
-    """Dynamically find India VIX token and validate fetched LTP."""
     try:
         if scrip_master_df is not None and not scrip_master_df.empty:
             vix_row = scrip_master_df[
@@ -304,12 +313,10 @@ def get_india_vix():
     except Exception as e:
         logger.error(f"India VIX Fetch Error: {e}")
 
-    logger.warning("Unable to fetch real-time VIX. Using safe default VIX: 14.5")
-    return 14.5
+    return 14.5  # Fallback default safe VIX value
 
 
 def get_itm_option_scrip(spot_price, option_type="CE"):
-    """Finds exact ITM option symbol using timezone-safe pandas parsing."""
     try:
         if scrip_master_df is None or scrip_master_df.empty:
             return None, None
@@ -327,8 +334,6 @@ def get_itm_option_scrip(spot_price, option_type="CE"):
             return None, None
 
         nifty_df["strike"] = pd.to_numeric(nifty_df["strike"], errors="coerce")
-
-        # Fix: Convert expiry safely to tz-naive Timestamp
         nifty_df["expiry_dt"] = pd.to_datetime(nifty_df["expiry"], format="%d%b%Y", errors="coerce")
         today = pd.Timestamp.now().floor("D")
 
@@ -346,11 +351,11 @@ def get_itm_option_scrip(spot_price, option_type="CE"):
     return None, None
 
 
-def fetch_nifty_candles(interval="FIVE_MINUTE"):
-    """Fetch candle data with increased delay to completely bypass SmartAPI rate limits."""
-    for attempt in range(2):
+def fetch_nifty_candles():
+    """Fetch 5-Minute candle data with strict 3-second delay enforcement."""
+    for attempt in range(3):
         try:
-            time.sleep(3.0)  # Safe delay to satisfy SmartAPI rate limits
+            rate_limit_cooldown(3.5)  # Enforces safe gap between calls
             now = get_ist_now()
             to_date = now.strftime("%Y-%m-%d %H:%M")
             from_date = (now - pd.Timedelta(days=5)).strftime("%Y-%m-%d 09:15")
@@ -359,7 +364,7 @@ def fetch_nifty_candles(interval="FIVE_MINUTE"):
                 {
                     "exchange": "NSE",
                     "symboltoken": NIFTY_TOKEN,
-                    "interval": interval,
+                    "interval": "FIVE_MINUTE",
                     "fromdate": from_date,
                     "todate": to_date,
                 }
@@ -375,43 +380,24 @@ def fetch_nifty_candles(interval="FIVE_MINUTE"):
                 df["roc"] = ta.momentum.roc(df["close"], window=9)
                 df["ema_9"] = ta.trend.ema_indicator(df["close"], window=9)
                 df["ema_21"] = ta.trend.ema_indicator(df["close"], window=21)
+                df["ema_50"] = ta.trend.ema_indicator(df["close"], window=50)  # Multi-trend indicator
                 return df.dropna().reset_index(drop=True)
+
+            logger.warning(
+                f"Candle Data Attempt {attempt+1} received invalid response. Retrying in 5 seconds..."
+            )
+            time.sleep(5)
 
         except Exception as e:
             logger.error(f"Candle Data Attempt {attempt+1} Failed: {e}")
-            time.sleep(4)
+            time.sleep(5)
 
     return None
 
 
-def get_15m_trend():
-    """Cached 15m Trend calculation to reduce API calls."""
-    global cached_15m_trend, last_15m_fetch_time
-    now = get_ist_now()
-
-    if last_15m_fetch_time is not None:
-        if (now - last_15m_fetch_time).total_seconds() < 300:
-            return cached_15m_trend
-
-    df_15m = fetch_nifty_candles(interval="FIFTEEN_MINUTE")
-    if df_15m is None or len(df_15m) < 2:
-        return cached_15m_trend
-
-    curr = df_15m.iloc[-1]
-    if curr["ema_9"] > curr["ema_21"] or curr["close"] > curr["ema_21"]:
-        cached_15m_trend = "BULLISH"
-    elif curr["ema_9"] < curr["ema_21"] or curr["close"] < curr["ema_21"]:
-        cached_15m_trend = "BEARISH"
-    else:
-        cached_15m_trend = "NEUTRAL"
-
-    last_15m_fetch_time = now
-    return cached_15m_trend
-
-
 def generate_trade_signal():
-    """5-Min Trigger Logic with Crossover & Trend Continuation."""
-    df = fetch_nifty_candles(interval="FIVE_MINUTE")
+    """Single-fetch Signal Logic using 5-Min Candles & 50 EMA for Trend Filtering."""
+    df = fetch_nifty_candles()
     if df is None or len(df) < 5:
         return "NO_TRADE"
 
@@ -421,12 +407,21 @@ def generate_trade_signal():
     recent_bull_cross = any(recent_candles["ema_9"] <= recent_candles["ema_21"]) and (curr["ema_9"] > curr["ema_21"])
     recent_bear_cross = any(recent_candles["ema_9"] >= recent_candles["ema_21"]) and (curr["ema_9"] < curr["ema_21"])
 
-    if (curr["rsi"] >= 58.0 and curr["roc"] > 0.0 and curr["ema_9"] > curr["ema_21"]) and (
-        recent_bull_cross or curr["rsi"] > 62
+    # Trend filter via 50 EMA from the same 5m dataset
+    is_bullish_trend = curr["close"] > curr["ema_50"]
+    is_bearish_trend = curr["close"] < curr["ema_50"]
+
+    if (
+        (curr["rsi"] >= 58.0 and curr["roc"] > 0.0 and curr["ema_9"] > curr["ema_21"])
+        and (recent_bull_cross or curr["rsi"] > 62)
+        and is_bullish_trend
     ):
         return "CE"
-    elif (curr["rsi"] <= 42.0 and curr["roc"] < 0.0 and curr["ema_9"] < curr["ema_21"]) and (
-        recent_bear_cross or curr["rsi"] < 38
+
+    elif (
+        (curr["rsi"] <= 42.0 and curr["roc"] < 0.0 and curr["ema_9"] < curr["ema_21"])
+        and (recent_bear_cross or curr["rsi"] < 38)
+        and is_bearish_trend
     ):
         return "PE"
 
@@ -535,14 +530,8 @@ def run_trading_cycle():
                 spot = get_nifty_spot_ltp()
                 if spot and spot > 0:
                     vix = get_india_vix()
-                    macro_trend = get_15m_trend()
-
                     if not (MIN_VIX <= vix <= MAX_VIX):
                         logger.info(f"Entry Blocked: VIX ({vix}) out of bounds ({MIN_VIX}-{MAX_VIX})")
-                    elif signal == "CE" and macro_trend == "BEARISH":
-                        logger.info("Entry Blocked: 15m Trend is BEARISH, cannot take CE")
-                    elif signal == "PE" and macro_trend == "BULLISH":
-                        logger.info("Entry Blocked: 15m Trend is BULLISH, cannot take PE")
                     else:
                         sym, tok = get_itm_option_scrip(spot, option_type=signal)
                         if sym and tok:
@@ -586,7 +575,7 @@ if __name__ == "__main__":
     )
     send_telegram_alert("🚀 <b>Nifty Option Algo Active!</b>\nEngine listening for signals...")
 
-    time.sleep(3)  # Cooldown before the first scan cycle
+    time.sleep(5)  # Mandatory startup cooldown for API key reset
 
     while is_market_open():
         try:
