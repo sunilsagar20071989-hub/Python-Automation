@@ -39,7 +39,7 @@ DEFAULT_TOTAL_CAPITAL = 100000.0
 SL_PCT = 0.045  # 4.5% Stop Loss
 TARGET_PCT = 0.25  # 25% Target Profit
 MAX_RISK_PER_TRADE_PCT = 0.015
-NIFTY_LOT_SIZE = 65  # Nifty Lot Size Updated
+NIFTY_LOT_SIZE = 65  # Nifty Lot Size
 ENABLE_TRAILING_SL = True
 TSL_ACTIVATION_PCT = 0.04
 TSL_STEP_TRIGGER_PCT = 0.02
@@ -51,7 +51,7 @@ ITM_STRIKE_OFFSET = 50
 NIFTY_TOKEN = "99926000"
 MAX_DAILY_TRADES = 4
 MAX_HOLDING_MINUTES = 22
-SCAN_INTERVAL_SECONDS = 25  # Safe interval between scans
+SCAN_INTERVAL_SECONDS = 30  # Increased scan gap for zero rate-limiting
 
 # Global State Tracking
 pos_active = False
@@ -75,11 +75,11 @@ smartApi = None
 LOG_FILE = "trade_log.csv"
 
 # Global rate limit tracker
-last_api_call_timestamp = 0
+last_api_call_timestamp = 0.0
 
 
 # ==========================================
-# 2. TIMEZONE & MARKET HOURS ENGINE
+# 2. TIMEZONE & RATE LIMIT ENGINE
 # ==========================================
 def get_ist_now():
     return datetime.now(pytz.timezone("Asia/Kolkata"))
@@ -99,8 +99,8 @@ def is_squareoff_time():
     return get_ist_now().time() >= dtime(15, 10)
 
 
-def rate_limit_cooldown(seconds=3.0):
-    """Enforces strict cooldown between consecutive SmartAPI calls."""
+def rate_limit_cooldown(seconds=4.0):
+    """Enforces strict minimum gap between consecutive API calls."""
     global last_api_call_timestamp
     elapsed = time.time() - last_api_call_timestamp
     if elapsed < seconds:
@@ -204,7 +204,7 @@ def place_order(symbol, token, buy_sell_type, quantity, exchange="NFO"):
             logger.info(f"[VIRTUAL ORDER] Executed {buy_sell_type} for {symbol} | Qty: {quantity}")
             return "VIRTUAL_ORDER_123"
 
-        rate_limit_cooldown(1.5)
+        rate_limit_cooldown(2.0)
         order_params = {
             "variety": "NORMAL",
             "tradingsymbol": str(symbol),
@@ -244,7 +244,7 @@ def calculate_dynamic_quantity(option_price):
     try:
         if option_price <= 0:
             return NIFTY_LOT_SIZE
-        rate_limit_cooldown(1.5)
+        rate_limit_cooldown(2.0)
         rms_data = smartApi.rmsLimit()
         net_capital = DEFAULT_TOTAL_CAPITAL
         if rms_data and rms_data.get("status") and "data" in rms_data:
@@ -276,7 +276,7 @@ def calculate_dynamic_quantity(option_price):
 # ==========================================
 def get_live_ltp(token, symbol, exchange="NFO"):
     try:
-        rate_limit_cooldown(1.5)
+        rate_limit_cooldown(2.0)
         ltp_data = smartApi.ltpData(exchange, symbol, str(token))
         if ltp_data and ltp_data.get("status") and "data" in ltp_data:
             return float(ltp_data["data"]["ltp"])
@@ -352,10 +352,10 @@ def get_itm_option_scrip(spot_price, option_type="CE"):
 
 
 def fetch_nifty_candles():
-    """Fetch 5-Minute candle data with strict 3-second delay enforcement."""
+    """Fetch 5-Minute candles with progressive backoff and strict rate limit control."""
     for attempt in range(3):
         try:
-            rate_limit_cooldown(3.5)  # Enforces safe gap between calls
+            rate_limit_cooldown(5.0)  # Extended gap before candle fetch
             now = get_ist_now()
             to_date = now.strftime("%Y-%m-%d %H:%M")
             from_date = (now - pd.Timedelta(days=5)).strftime("%Y-%m-%d 09:15")
@@ -380,23 +380,21 @@ def fetch_nifty_candles():
                 df["roc"] = ta.momentum.roc(df["close"], window=9)
                 df["ema_9"] = ta.trend.ema_indicator(df["close"], window=9)
                 df["ema_21"] = ta.trend.ema_indicator(df["close"], window=21)
-                df["ema_50"] = ta.trend.ema_indicator(df["close"], window=50)  # Multi-trend indicator
+                df["ema_50"] = ta.trend.ema_indicator(df["close"], window=50)
                 return df.dropna().reset_index(drop=True)
 
-            logger.warning(
-                f"Candle Data Attempt {attempt+1} received invalid response. Retrying in 5 seconds..."
-            )
-            time.sleep(5)
+            logger.warning(f"Candle Data Attempt {attempt+1} blocked or invalid. Retrying in 6s...")
+            time.sleep(6)
 
         except Exception as e:
-            logger.error(f"Candle Data Attempt {attempt+1} Failed: {e}")
-            time.sleep(5)
+            logger.error(f"Candle Data Attempt {attempt+1} Exception: {e}")
+            time.sleep(6)
 
     return None
 
 
 def generate_trade_signal():
-    """Single-fetch Signal Logic using 5-Min Candles & 50 EMA for Trend Filtering."""
+    """Single-fetch Signal Engine with 50 EMA Trend Filter."""
     df = fetch_nifty_candles()
     if df is None or len(df) < 5:
         return "NO_TRADE"
@@ -407,7 +405,6 @@ def generate_trade_signal():
     recent_bull_cross = any(recent_candles["ema_9"] <= recent_candles["ema_21"]) and (curr["ema_9"] > curr["ema_21"])
     recent_bear_cross = any(recent_candles["ema_9"] >= recent_candles["ema_21"]) and (curr["ema_9"] < curr["ema_21"])
 
-    # Trend filter via 50 EMA from the same 5m dataset
     is_bullish_trend = curr["close"] > curr["ema_50"]
     is_bearish_trend = curr["close"] < curr["ema_50"]
 
@@ -575,7 +572,7 @@ if __name__ == "__main__":
     )
     send_telegram_alert("🚀 <b>Nifty Option Algo Active!</b>\nEngine listening for signals...")
 
-    time.sleep(5)  # Mandatory startup cooldown for API key reset
+    time.sleep(10)  # Mandatory startup cooldown for IP rate-limit release
 
     while is_market_open():
         try:
