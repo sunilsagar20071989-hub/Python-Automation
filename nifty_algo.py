@@ -9,13 +9,11 @@ import pytz
 import pandas as pd
 import ta
 from datetime import datetime, time as dtime
-
 try:
     from dotenv import load_dotenv
     load_dotenv()
 except ImportError:
     pass
-
 from SmartApi import SmartConnect
 
 # ==========================================
@@ -29,19 +27,9 @@ logger = logging.getLogger("NiftyAlgo")
 # ==========================================
 # 1. HYBRID CONFIG & PARAMETERS
 # ==========================================
-# Set True for Hybrid Mode (Place API order to log in Order Book + Run Virtual Tracking)
 PAPER_TRADING = True  
-
-API_KEY = (
-    os.getenv("SMARTAPI_API_KEY")
-    or os.getenv("SMARTAPI_KEY")
-    or os.getenv("API_KEY")
-)
-CLIENT_CODE = (
-    os.getenv("SMARTAPI_CLIENT_CODE")
-    or os.getenv("CLIENT_CODE")
-    or os.getenv("CLIENT_ID")
-)
+API_KEY = os.getenv("SMARTAPI_API_KEY") or os.getenv("SMARTAPI_KEY") or os.getenv("API_KEY")
+CLIENT_CODE = os.getenv("SMARTAPI_CLIENT_CODE") or os.getenv("CLIENT_CODE") or os.getenv("CLIENT_ID")
 PIN = os.getenv("SMARTAPI_PIN") or os.getenv("PIN")
 TOTP_SECRET = os.getenv("SMARTAPI_TOTP_SECRET") or os.getenv("TOTP_SECRET")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -51,19 +39,17 @@ DEFAULT_TOTAL_CAPITAL = 100000.0
 SL_PCT = 0.045               # 4.5% Stop Loss
 TARGET_PCT = 0.25             # 25% Target Profit
 MAX_RISK_PER_TRADE_PCT = 0.015
-NIFTY_LOT_SIZE = 65           # Nifty Lot Size
+NIFTY_LOT_SIZE = 65           # Nifty Lot Size Updated
 ENABLE_TRAILING_SL = True
 TSL_ACTIVATION_PCT = 0.04
 TSL_STEP_TRIGGER_PCT = 0.02
 TSL_STEP_MOVE_PCT = 0.015
 
-MIN_VIX = 10.0
-MAX_VIX = 24.0
+MIN_VIX = 9.0
+MAX_VIX = 26.0
 ITM_STRIKE_OFFSET = 50
-
 NIFTY_TOKEN = "99926000"
 INDIA_VIX_TOKEN = "99926009"
-
 MAX_DAILY_TRADES = 4
 MAX_HOLDING_MINUTES = 22
 SCAN_INTERVAL_SECONDS = 15
@@ -80,11 +66,9 @@ highest_price_seen = 0.0
 tsl_activated = False
 active_quantity = NIFTY_LOT_SIZE
 trade_entry_time = None
-
 daily_trades_count = 0
 consecutive_sl_count = 0
 consecutive_win_count = 0
-
 scrip_master_df = None
 auth_token = ""
 feed_token = ""
@@ -137,9 +121,7 @@ def send_telegram_alert(message, max_retries=3):
 
 def log_trade(symbol, trade_type, entry_p, exit_p, qty, reason):
     pnl = round((exit_p - entry_p) * qty, 2)
-    pnl_pct = (
-        round(((exit_p - entry_p) / entry_p) * 100, 2) if entry_p > 0 else 0.0
-    )
+    pnl_pct = round(((exit_p - entry_p) / entry_p) * 100, 2) if entry_p > 0 else 0.0
     log_data = {
         "Timestamp": get_ist_now().strftime("%Y-%m-%d %H:%M:%S"),
         "Mode": "PAPER" if PAPER_TRADING else "LIVE",
@@ -189,9 +171,7 @@ def initialize_smartapi():
                         scrip_master_df["token"] = scrip_master_df["token"].astype(str)
                     if "symbol" in scrip_master_df.columns:
                         scrip_master_df["symbol"] = scrip_master_df["symbol"].astype(str)
-                    logger.info(
-                        f"Scrip Master Loaded! Total Records: {len(scrip_master_df)}"
-                    )
+                    logger.info(f"Scrip Master Loaded! Total Records: {len(scrip_master_df)}")
                     break
             except Exception:
                 continue
@@ -213,17 +193,14 @@ def place_order(symbol, token, buy_sell_type, quantity, exchange="NFO"):
             "price": "0",
             "quantity": str(quantity),
         }
-        
-        # SmartAPI Order Placement (Creates entry in Angel One Order Book)
         order_id = "VIRTUAL_ORDER"
         if smartApi is not None:
             response = smartApi.placeOrder(order_params)
             if response and response.get("status") and "data" in response:
                 order_id = response["data"]["orderid"]
             else:
-                logger.warning(f"Angel One Order Attempted but rejected/failed. Continuing virtual tracking.")
+                logger.warning("Angel One Order Attempted but rejected/failed. Continuing virtual tracking.")
                 order_id = "REJECTED_ORDER_BOOK"
-
         send_telegram_alert(
             f"<b>ORDER SENT TO BROKER</b>\n"
             f"<b>Symbol:</b> {symbol}\n"
@@ -234,7 +211,6 @@ def place_order(symbol, token, buy_sell_type, quantity, exchange="NFO"):
         return order_id
     except Exception as e:
         logger.error(f"[ORDER EXCEPTION]: {e}")
-        # Even if broker API fails, return a synthetic ID for paper tracking
         if PAPER_TRADING:
             return "VIRTUAL_ORDER_EXCEPTION"
     return None
@@ -247,12 +223,9 @@ def calculate_dynamic_quantity(option_price):
         net_capital = DEFAULT_TOTAL_CAPITAL
         if rms_data and rms_data.get("status") and "data" in rms_data:
             data_dict = rms_data["data"]
-            net_capital = float(
-                data_dict.get("net", data_dict.get("availablecash", DEFAULT_TOTAL_CAPITAL))
-            )
+            net_capital = float(data_dict.get("net", data_dict.get("availablecash", DEFAULT_TOTAL_CAPITAL)))
         if net_capital <= 0:
             net_capital = DEFAULT_TOTAL_CAPITAL
-
         max_risk_amount = net_capital * MAX_RISK_PER_TRADE_PCT
         risk_per_share = option_price * SL_PCT
         if risk_per_share <= 0:
@@ -353,58 +326,41 @@ def fetch_nifty_candles(interval="FIVE_MINUTE"):
     return None
 
 def get_15m_trend():
+    """Higher Timeframe Trend Directional Filter."""
     df_15m = fetch_nifty_candles(interval="FIFTEEN_MINUTE")
     if df_15m is None or len(df_15m) < 2:
         return "NEUTRAL"
     curr = df_15m.iloc[-1]
-    return "BULLISH" if curr["ema_9"] > curr["ema_21"] else "BEARISH"
+    
+    # Simple & robust check: EMA alignment or Price position relative to 21 EMA
+    if curr["ema_9"] > curr["ema_21"] or curr["close"] > curr["ema_21"]:
+        return "BULLISH"
+    elif curr["ema_9"] < curr["ema_21"] or curr["close"] < curr["ema_21"]:
+        return "BEARISH"
+    return "NEUTRAL"
 
 def generate_trade_signal():
+    """5-Min Trigger Logic with Flexible Lookback for Crossover and Trend Continuation."""
     df = fetch_nifty_candles(interval="FIVE_MINUTE")
-    if df is None or len(df) < 25:
+    if df is None or len(df) < 5:
         return "NO_TRADE"
+    
     curr = df.iloc[-1]
-    prev = df.iloc[-2]
-    if (
-        curr["rsi"] >= 60.0
-        and curr["roc"] > 0.0
-        and curr["ema_9"] > curr["ema_21"]
-        and prev["ema_9"] <= prev["ema_21"]
-    ):
+    recent_candles = df.iloc[-4:-1]  # Lookback last 3 candles for crossover flexibility
+    
+    # Check for crossover in last 3 candles
+    recent_bull_cross = any(recent_candles["ema_9"] <= recent_candles["ema_21"]) and (curr["ema_9"] > curr["ema_21"])
+    recent_bear_cross = any(recent_candles["ema_9"] >= recent_candles["ema_21"]) and (curr["ema_9"] < curr["ema_21"])
+    
+    # CE Entry Signal
+    if (curr["rsi"] >= 58.0 and curr["roc"] > 0.0 and curr["ema_9"] > curr["ema_21"]) and (recent_bull_cross or curr["rsi"] > 62):
         return "CE"
-    elif (
-        curr["rsi"] <= 40.0
-        and curr["roc"] < 0.0
-        and curr["ema_9"] < curr["ema_21"]
-        and prev["ema_9"] >= prev["ema_21"]
-    ):
+    
+    # PE Entry Signal
+    elif (curr["rsi"] <= 42.0 and curr["roc"] < 0.0 and curr["ema_9"] < curr["ema_21"]) and (recent_bear_cross or curr["rsi"] < 38):
         return "PE"
+        
     return "NO_TRADE"
-
-def get_option_chain_pcr_and_levels(spot_price):
-    return 1.0, spot_price + 100, spot_price - 100
-
-def validate_trade_with_option_chain(
-    signal, current_price, pcr, resistance_strike, support_strike
-):
-    buffer_points = 40
-    if signal == "CE":
-        if pcr < 0.6:
-            logger.info(f"❌ TRADE REJECTED: Bearish PCR ({pcr:.2f})")
-            return False
-        if (resistance_strike - current_price) <= buffer_points and current_price < resistance_strike:
-            logger.info(f"❌ TRADE REJECTED: Price near Resistance ({resistance_strike})")
-            return False
-        return True
-    elif signal == "PE":
-        if pcr > 1.4:
-            logger.info(f"❌ TRADE REJECTED: Bullish PCR ({pcr:.2f})")
-            return False
-        if (current_price - support_strike) <= buffer_points and current_price > support_strike:
-            logger.info(f"❌ TRADE REJECTED: Price near Support ({support_strike})")
-            return False
-        return True
-    return False
 
 def cleanup_position():
     global pos_active, active_symbol, active_token, entry_price, sl_price, tgt_price, highest_price_seen, tsl_activated
@@ -428,37 +384,23 @@ def run_trading_cycle():
     if is_squareoff_time() and pos_active:
         ltp = get_live_ltp(active_token, active_symbol) or entry_price
         place_order(active_symbol, active_token, "SELL", active_quantity)
-        log_trade(
-            active_symbol,
-            "SELL",
-            entry_price,
-            ltp,
-            active_quantity,
-            "AUTO_SQUARE_OFF",
-        )
+        log_trade(active_symbol, "SELL", entry_price, ltp, active_quantity, "AUTO_SQUARE_OFF")
         send_telegram_alert(f"⏰ AUTO SQUARE-OFF (03:10 PM) | Exit: ₹{ltp:.2f}")
         cleanup_position()
         return
 
     if pos_active:
         ltp = get_live_ltp(active_token, active_symbol) or entry_price
-        holding_time_mins = (
-            get_ist_now() - trade_entry_time
-        ).total_seconds() / 60.0
-
+        holding_time_mins = (get_ist_now() - trade_entry_time).total_seconds() / 60.0
+        
         if ltp > highest_price_seen:
             highest_price_seen = ltp
 
         if ENABLE_TRAILING_SL and highest_price_seen > entry_price:
             gain_pct = (highest_price_seen - entry_price) / entry_price
             if gain_pct >= TSL_ACTIVATION_PCT:
-                steps = (
-                    int((gain_pct - TSL_ACTIVATION_PCT) / TSL_STEP_TRIGGER_PCT)
-                    + 1
-                )
-                new_sl = round(
-                    entry_price * (1 + (steps * TSL_STEP_MOVE_PCT)), 2
-                )
+                steps = int((gain_pct - TSL_ACTIVATION_PCT) / TSL_STEP_TRIGGER_PCT) + 1
+                new_sl = round(entry_price * (1 + (steps * TSL_STEP_MOVE_PCT)), 2)
                 if new_sl > sl_price:
                     sl_price = new_sl
                     tsl_activated = True
@@ -467,14 +409,7 @@ def run_trading_cycle():
         if ltp <= sl_price:
             reason = "TRAILING_SL_HIT" if tsl_activated else "INITIAL_SL_HIT"
             place_order(active_symbol, active_token, "SELL", active_quantity)
-            log_trade(
-                active_symbol,
-                "SELL",
-                entry_price,
-                ltp,
-                active_quantity,
-                reason,
-            )
+            log_trade(active_symbol, "SELL", entry_price, ltp, active_quantity, reason)
             send_telegram_alert(
                 f"🔴 <b>STOP LOSS HIT ({reason})</b>\n"
                 f"<b>Symbol:</b> {active_symbol}\n"
@@ -488,14 +423,7 @@ def run_trading_cycle():
 
         elif ltp >= tgt_price:
             place_order(active_symbol, active_token, "SELL", active_quantity)
-            log_trade(
-                active_symbol,
-                "SELL",
-                entry_price,
-                ltp,
-                active_quantity,
-                "TARGET_ACHIEVED",
-            )
+            log_trade(active_symbol, "SELL", entry_price, ltp, active_quantity, "TARGET_ACHIEVED")
             send_telegram_alert(
                 f"🟢 <b>TARGET ACHIEVED</b> 🎉\n"
                 f"<b>Symbol:</b> {active_symbol}\n"
@@ -509,14 +437,7 @@ def run_trading_cycle():
 
         elif holding_time_mins >= MAX_HOLDING_MINUTES:
             place_order(active_symbol, active_token, "SELL", active_quantity)
-            log_trade(
-                active_symbol,
-                "SELL",
-                entry_price,
-                ltp,
-                active_quantity,
-                "THETA_TIMEOUT",
-            )
+            log_trade(active_symbol, "SELL", entry_price, ltp, active_quantity, "THETA_TIMEOUT")
             send_telegram_alert(
                 f"⏱️ <b>THETA TIMEOUT EXIT</b>\n"
                 f"<b>Symbol:</b> {active_symbol}\n"
@@ -543,17 +464,9 @@ def run_trading_cycle():
                 if spot and spot > 0:
                     vix = get_india_vix()
                     macro_trend = get_15m_trend()
-                    pcr, res_s, sup_s = get_option_chain_pcr_and_levels(spot)
-                    is_oc_valid = validate_trade_with_option_chain(
-                        signal, spot, pcr, res_s, sup_s
-                    )
                     
                     if not (MIN_VIX <= vix <= MAX_VIX):
-                        logger.info(
-                            f"Entry Blocked: VIX ({vix}) out of bounds ({MIN_VIX}-{MAX_VIX})"
-                        )
-                    elif not is_oc_valid:
-                        logger.info("Entry Blocked: Failed Option Chain validation")
+                        logger.info(f"Entry Blocked: VIX ({vix}) out of bounds ({MIN_VIX}-{MAX_VIX})")
                     elif signal == "CE" and macro_trend == "BEARISH":
                         logger.info("Entry Blocked: 15m Trend is BEARISH, cannot take CE")
                     elif signal == "PE" and macro_trend == "BULLISH":
