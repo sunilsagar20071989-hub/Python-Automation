@@ -3,11 +3,10 @@
 # ==========================================
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime as dt, time as dtime, timedelta
+from datetime import datetime as dt, timedelta
 import logging
 import os
 import sys
-import threading
 import time
 from dotenv import load_dotenv
 import pandas as pd
@@ -15,7 +14,6 @@ import pyotp
 import pytz
 import requests
 import ta
-import telebot
 from SmartApi import SmartConnect
 
 # Logging Setup
@@ -56,32 +54,6 @@ if missing_vars:
 # TIMEZONE CONFIG
 IST = pytz.timezone("Asia/Kolkata")
 
-# Telegram Bot Initialization
-bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN) if TELEGRAM_BOT_TOKEN else None
-
-if bot:
-    @bot.message_handler(func=lambda message: True)
-    def handle_telegram_messages(message):
-        chat_id = message.chat.id
-        user_name = message.from_user.first_name
-        logger.info(
-            f"Telegram Activity | User: {user_name} | Chat ID: {chat_id}"
-        )
-        bot.reply_to(
-            message,
-            f"Hello {user_name}! Aapki Chat ID: `{chat_id}`",
-            parse_mode="Markdown",
-        )
-
-    def start_telegram_polling():
-        try:
-            logger.info("Telegram Bot listener active...")
-            bot.infinity_polling(timeout=10, long_polling_timeout=5)
-        except Exception as e:
-            logger.error(f"Telegram Polling Exception: {e}")
-
-    threading.Thread(target=start_telegram_polling, daemon=True).start()
-
 # STRATEGY THRESHOLDS
 MIN_RSI = 60.0
 MIN_ROC = 0.0
@@ -101,14 +73,15 @@ http_session = requests.Session()
 
 
 # ==========================================
-# 2. TELEGRAM ALERT ENGINE
+# 2. DIRECT TELEGRAM ALERT ENGINE
 # ==========================================
 def send_telegram_alert(trade_data):
-    if not bot or not TELEGRAM_CHAT_ID:
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        logger.warning("Telegram Credentials missing. Skipping alert.")
         return
 
     msg = (
-        f"<b>🚀 MOMENTUM SCANNER SIGNAL DETECTED</b>\n"
+        f"🚀 <b>MOMENTUM SCANNER SIGNAL DETECTED</b>\n"
         f"-----------------------------------------\n"
         f"<b>Symbol:</b> {trade_data['Symbol']}\n"
         f"<b>Entry Price:</b> ₹{trade_data['LTP']}\n"
@@ -122,11 +95,19 @@ def send_telegram_alert(trade_data):
         f"<i>Timestamp: {dt.now(IST).strftime('%d-%b-%Y %H:%M:%S')}</i>"
     )
 
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": msg,
+        "parse_mode": "HTML",
+    }
+
     try:
-        bot.send_message(
-            chat_id=TELEGRAM_CHAT_ID, text=msg, parse_mode="HTML"
-        )
-        logger.info(f"Telegram alert sent for {trade_data['Symbol']}")
+        resp = requests.post(url, data=payload, timeout=5)
+        if resp.status_code == 200:
+            logger.info(f"Telegram alert sent for {trade_data['Symbol']}")
+        else:
+            logger.error(f"Telegram Error ({resp.status_code}): {resp.text}")
     except Exception as e:
         logger.error(f"Failed Telegram alert for {trade_data['Symbol']}: {e}")
 
