@@ -49,7 +49,6 @@ MIN_VIX = 9.0
 MAX_VIX = 26.0
 ITM_STRIKE_OFFSET = 50
 NIFTY_TOKEN = "99926000"
-INDIA_VIX_TOKEN = "26009"  # FIXED: Correct Angel One India VIX Token
 MAX_DAILY_TRADES = 4
 MAX_HOLDING_MINUTES = 22
 SCAN_INTERVAL_SECONDS = 15
@@ -75,7 +74,7 @@ feed_token = ""
 smartApi = None
 LOG_FILE = "trade_log.csv"
 
-# Global Cache for Trend to Avoid API Rate Limits
+# Trend Cache to prevent excessive API Rate Limit hits
 cached_15m_trend = "NEUTRAL"
 last_15m_fetch_time = None
 
@@ -267,7 +266,7 @@ def calculate_dynamic_quantity(option_price):
 # ==========================================
 def get_live_ltp(token, symbol, exchange="NFO"):
     try:
-        time.sleep(0.3)  # Rate limiting cooldown
+        time.sleep(0.3)  # Cooldown between REST calls
         ltp_data = smartApi.ltpData(exchange, symbol, str(token))
         if ltp_data and ltp_data.get("status") and "data" in ltp_data:
             return float(ltp_data["data"]["ltp"])
@@ -281,10 +280,32 @@ def get_nifty_spot_ltp():
 
 
 def get_india_vix():
-    vix = get_live_ltp(INDIA_VIX_TOKEN, "INDIA VIX", exchange="NSE")
-    if vix and vix > 0:
-        return vix
-    return 15.0  # Default fallback if API drops
+    """Dynamically find India VIX token and validate fetched LTP."""
+    try:
+        if scrip_master_df is not None and not scrip_master_df.empty:
+            vix_row = scrip_master_df[
+                (scrip_master_df["name"] == "INDIA VIX")
+                | (scrip_master_df["symbol"] == "INDIA VIX")
+                | (scrip_master_df["symbol"] == "India Vix")
+            ]
+            if not vix_row.empty:
+                vix_token = str(vix_row.iloc[0]["token"])
+                vix_symbol = str(vix_row.iloc[0]["symbol"])
+                vix_exch = str(vix_row.iloc[0].get("exch_seg", "NSE"))
+
+                vix_ltp = get_live_ltp(vix_token, vix_symbol, exchange=vix_exch)
+                if vix_ltp and 5.0 <= vix_ltp <= 100.0:
+                    return vix_ltp
+
+        direct_vix = get_live_ltp("26009", "INDIA VIX", exchange="NSE")
+        if direct_vix and 5.0 <= direct_vix <= 100.0:
+            return direct_vix
+
+    except Exception as e:
+        logger.error(f"India VIX Fetch Error: {e}")
+
+    logger.warning("Unable to fetch real-time VIX. Using safe default VIX: 14.5")
+    return 14.5
 
 
 def get_itm_option_scrip(spot_price, option_type="CE"):
@@ -318,38 +339,43 @@ def get_itm_option_scrip(spot_price, option_type="CE"):
 
 
 def fetch_nifty_candles(interval="FIVE_MINUTE"):
-    try:
-        time.sleep(1.0)  # Safe delay to respect SmartAPI rate limit
-        now = get_ist_now()
-        to_date = now.strftime("%Y-%m-%d %H:%M")
-        from_date = (now - pd.Timedelta(days=5)).strftime("%Y-%m-%d 09:15")
-        candles = smartApi.getCandleData(
-            {
-                "exchange": "NSE",
-                "symboltoken": NIFTY_TOKEN,
-                "interval": interval,
-                "fromdate": from_date,
-                "todate": to_date,
-            }
-        )
-        if candles and candles.get("status") and "data" in candles:
-            df = pd.DataFrame(
-                candles["data"],
-                columns=["timestamp", "open", "high", "low", "close", "volume"],
+    """Fetch candle data with rate-limit protection and retries."""
+    for attempt in range(2):
+        try:
+            time.sleep(1.5)  # Enforce 1.5s delay to prevent 'Access Denied' throttling
+            now = get_ist_now()
+            to_date = now.strftime("%Y-%m-%d %H:%M")
+            from_date = (now - pd.Timedelta(days=5)).strftime("%Y-%m-%d 09:15")
+
+            candles = smartApi.getCandleData(
+                {
+                    "exchange": "NSE",
+                    "symboltoken": NIFTY_TOKEN,
+                    "interval": interval,
+                    "fromdate": from_date,
+                    "todate": to_date,
+                }
             )
-            df["close"] = df["close"].astype(float)
-            df["rsi"] = ta.momentum.rsi(df["close"], window=14)
-            df["roc"] = ta.momentum.roc(df["close"], window=9)
-            df["ema_9"] = ta.trend.ema_indicator(df["close"], window=9)
-            df["ema_21"] = ta.trend.ema_indicator(df["close"], window=21)
-            return df.dropna().reset_index(drop=True)
-    except Exception as e:
-        logger.error(f"Candle Data Fetch Error: {e}")
+            if candles and isinstance(candles, dict) and candles.get("status") and "data" in candles:
+                df = pd.DataFrame(
+                    candles["data"],
+                    columns=["timestamp", "open", "high", "low", "close", "volume"],
+                )
+                df["close"] = df["close"].astype(float)
+                df["rsi"] = ta.momentum.rsi(df["close"], window=14)
+                df["roc"] = ta.momentum.roc(df["close"], window=9)
+                df["ema_9"] = ta.trend.ema_indicator(df["close"], window=9)
+                df["ema_21"] = ta.trend.ema_indicator(df["close"], window=21)
+                return df.dropna().reset_index(drop=True)
+        except Exception as e:
+            logger.error(f"Candle Data Attempt {attempt+1} Failed: {e}")
+            time.sleep(2)
+
     return None
 
 
 def get_15m_trend():
-    """Higher Timeframe Trend Directional Filter (Cached for 5 mins)."""
+    """Cached 15m Trend calculation to reduce API calls."""
     global cached_15m_trend, last_15m_fetch_time
     now = get_ist_now()
 
