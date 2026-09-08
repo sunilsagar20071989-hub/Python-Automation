@@ -266,7 +266,7 @@ def calculate_dynamic_quantity(option_price):
 # ==========================================
 def get_live_ltp(token, symbol, exchange="NFO"):
     try:
-        time.sleep(0.3)  # Cooldown between REST calls
+        time.sleep(0.5)  # Enforced delay between REST calls
         ltp_data = smartApi.ltpData(exchange, symbol, str(token))
         if ltp_data and ltp_data.get("status") and "data" in ltp_data:
             return float(ltp_data["data"]["ltp"])
@@ -309,22 +309,28 @@ def get_india_vix():
 
 
 def get_itm_option_scrip(spot_price, option_type="CE"):
+    """Finds exact ITM option symbol using timezone-safe pandas parsing."""
     try:
         if scrip_master_df is None or scrip_master_df.empty:
             return None, None
+
         atm_strike = round(spot_price / 50.0) * 50
         itm_strike = atm_strike - ITM_STRIKE_OFFSET if option_type == "CE" else atm_strike + ITM_STRIKE_OFFSET
+
         nifty_df = scrip_master_df[
             (scrip_master_df["name"] == "NIFTY")
             & (scrip_master_df["instrumenttype"] == "OPTIDX")
             & (scrip_master_df["symbol"].str.endswith(option_type))
         ].copy()
+
         if nifty_df.empty:
             return None, None
 
         nifty_df["strike"] = pd.to_numeric(nifty_df["strike"], errors="coerce")
-        nifty_df["expiry_dt"] = pd.to_datetime(nifty_df["expiry"], errors="coerce")
-        today = get_ist_now().replace(hour=0, minute=0, second=0, microsecond=0)
+
+        # Fix: Convert expiry safely to tz-naive Timestamp
+        nifty_df["expiry_dt"] = pd.to_datetime(nifty_df["expiry"], format="%d%b%Y", errors="coerce")
+        today = pd.Timestamp.now().floor("D")
 
         valid_df = nifty_df[(nifty_df["strike"] == itm_strike) & (nifty_df["expiry_dt"] >= today)].sort_values(
             by="expiry_dt"
@@ -333,16 +339,18 @@ def get_itm_option_scrip(spot_price, option_type="CE"):
         if not valid_df.empty:
             selected_row = valid_df.iloc[0]
             return selected_row["symbol"], str(selected_row["token"])
+
     except Exception as e:
         logger.error(f"ITM Option Strike Finder Error: {e}")
+
     return None, None
 
 
 def fetch_nifty_candles(interval="FIVE_MINUTE"):
-    """Fetch candle data with rate-limit protection and retries."""
+    """Fetch candle data with rate-limit protection and backoff retries."""
     for attempt in range(2):
         try:
-            time.sleep(1.5)  # Enforce 1.5s delay to prevent 'Access Denied' throttling
+            time.sleep(2.5)  # Enforce 2.5s delay to completely bypass SmartAPI Access Rate limits
             now = get_ist_now()
             to_date = now.strftime("%Y-%m-%d %H:%M")
             from_date = (now - pd.Timedelta(days=5)).strftime("%Y-%m-%d 09:15")
@@ -356,6 +364,7 @@ def fetch_nifty_candles(interval="FIVE_MINUTE"):
                     "todate": to_date,
                 }
             )
+
             if candles and isinstance(candles, dict) and candles.get("status") and "data" in candles:
                 df = pd.DataFrame(
                     candles["data"],
@@ -367,9 +376,10 @@ def fetch_nifty_candles(interval="FIVE_MINUTE"):
                 df["ema_9"] = ta.trend.ema_indicator(df["close"], window=9)
                 df["ema_21"] = ta.trend.ema_indicator(df["close"], window=21)
                 return df.dropna().reset_index(drop=True)
+
         except Exception as e:
             logger.error(f"Candle Data Attempt {attempt+1} Failed: {e}")
-            time.sleep(2)
+            time.sleep(3)
 
     return None
 
@@ -400,7 +410,7 @@ def get_15m_trend():
 
 
 def generate_trade_signal():
-    """5-Min Trigger Logic with Flexible Lookback for Crossover and Trend Continuation."""
+    """5-Min Trigger Logic with Crossover & Trend Continuation."""
     df = fetch_nifty_candles(interval="FIVE_MINUTE")
     if df is None or len(df) < 5:
         return "NO_TRADE"
