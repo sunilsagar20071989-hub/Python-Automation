@@ -25,7 +25,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger("NiftyAlgo")
 
 # ==========================================
-# 1. HYBRID CONFIG & PARAMETERS
+# 1. HYBRID CONFIG & PARAMETERS (65-70 TUNED)
 # ==========================================
 API_KEY = os.getenv("SMARTAPI_API_KEY") or os.getenv("SMARTAPI_KEY") or os.getenv("API_KEY")
 CLIENT_CODE = os.getenv("SMARTAPI_CLIENT_CODE") or os.getenv("CLIENT_CODE") or os.getenv("CLIENT_ID")
@@ -35,12 +35,14 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 DEFAULT_TOTAL_CAPITAL = 100000.0
-SL_PCT = 0.045  # 4.5% Stop Loss
-TARGET_PCT = 0.25  # 25% Target Profit
+SL_PCT = 0.045               # 4.5% Initial Stop Loss
+TARGET_PCT = 0.14            # 14.0% Target Profit
 MAX_RISK_PER_TRADE_PCT = 0.015
-NIFTY_LOT_SIZE = 65  # Nifty Lot Size
+NIFTY_LOT_SIZE = 65          # Nifty Lot Size
+
 ENABLE_TRAILING_SL = True
-TSL_ACTIVATION_PCT = 0.04
+TSL_ACTIVATION_PCT = 0.025   # Activate TSL at +2.5% gain
+TSL_LOCK_PCT = 0.005         # Initial lock at +0.5% above entry
 TSL_STEP_TRIGGER_PCT = 0.02
 TSL_STEP_MOVE_PCT = 0.015
 
@@ -49,8 +51,8 @@ MAX_VIX = 26.0
 ITM_STRIKE_OFFSET = 50
 NIFTY_TOKEN = "99926000"
 MAX_DAILY_TRADES = 4
-MAX_HOLDING_MINUTES = 22
-SCAN_INTERVAL_SECONDS = 30  # Increased scan gap for zero rate-limiting
+MAX_HOLDING_MINUTES = 30     # Theta timeout in minutes
+SCAN_INTERVAL_SECONDS = 30   # Increased scan gap for zero rate-limiting
 
 # Global State Tracking
 pos_active = False
@@ -117,7 +119,7 @@ def send_telegram_alert(message, max_retries=3, allow_after_hours=False):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
 
-    full_message = f"⚡ [REAL TRADE] {message}"
+    full_message = f"⚡ [ALGO] {message}"
 
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
@@ -139,7 +141,7 @@ def log_trade(symbol, trade_type, entry_p, exit_p, qty, reason):
     pnl_pct = round(((exit_p - entry_p) / entry_p) * 100, 2) if entry_p > 0 else 0.0
     log_data = {
         "Timestamp": get_ist_now().strftime("%Y-%m-%d %H:%M:%S"),
-        "Mode": "LIVE",
+        "Mode": "ENGINE",
         "Symbol": symbol,
         "Type": trade_type,
         "Entry_Price": entry_p,
@@ -152,7 +154,7 @@ def log_trade(symbol, trade_type, entry_p, exit_p, qty, reason):
     df_log = pd.DataFrame([log_data])
     file_exists = os.path.isfile(LOG_FILE)
     df_log.to_csv(LOG_FILE, mode="a", header=not file_exists, index=False)
-    logger.info(f"[LIVE LOGGED] PnL: ₹{pnl} ({pnl_pct}%) | Exit: {reason}")
+    logger.info(f"[LOGGED] PnL: ₹{pnl} ({pnl_pct}%) | Exit: {reason}")
 
 
 # ==========================================
@@ -199,7 +201,7 @@ def initialize_smartapi():
 def place_order(symbol, token, buy_sell_type, quantity, exchange="NFO"):
     try:
         if smartApi is None:
-            logger.error("SmartAPI client not initialized. Cannot place live order.")
+            logger.error("SmartAPI client not initialized. Cannot place order.")
             return None
 
         rate_limit_cooldown(2.0)
@@ -344,6 +346,39 @@ def get_itm_option_scrip(spot_price, option_type="CE"):
     return None, None
 
 
+def get_15m_trend():
+    """15-Minute Macro Filter Logic."""
+    try:
+        rate_limit_cooldown(4.0)
+        now = get_ist_now()
+        to_date = now.strftime("%Y-%m-%d %H:%M")
+        from_date = (now - pd.Timedelta(days=4)).strftime("%Y-%m-%d 09:15")
+        resp = smartApi.getCandleData(
+            {
+                "exchange": "NSE",
+                "symboltoken": NIFTY_TOKEN,
+                "interval": "FIFTEEN_MINUTE",
+                "fromdate": from_date,
+                "todate": to_date,
+            }
+        )
+        if resp and resp.get("status") and resp.get("data"):
+            df = pd.DataFrame(resp["data"], columns=["timestamp", "open", "high", "low", "close", "volume"])
+            df["close"] = df["close"].astype(float)
+            df["ema_9"] = ta.trend.ema_indicator(df["close"], window=9)
+            df["ema_21"] = ta.trend.ema_indicator(df["close"], window=21)
+            df_clean = df.dropna()
+            if not df_clean.empty:
+                curr = df_clean.iloc[-1]
+                if curr["ema_9"] > curr["ema_21"]:
+                    return "BULLISH"
+                elif curr["ema_9"] < curr["ema_21"]:
+                    return "BEARISH"
+    except Exception as e:
+        logger.error(f"15m Trend Fetch Error: {e}")
+    return "NEUTRAL"
+
+
 def fetch_nifty_candles():
     """Fetch 5-Minute candles with progressive backoff and strict rate limit control."""
     for attempt in range(3):
@@ -387,7 +422,7 @@ def fetch_nifty_candles():
 
 
 def generate_trade_signal():
-    """Single-fetch Signal Engine with 50 EMA Trend Filter + Debug Reason."""
+    """Single-fetch Signal Engine with 9/21/50 EMA Stack, RSI 60/40, ROC ±0.05 & 15m Filter."""
     df = fetch_nifty_candles()
     if df is None or len(df) < 5:
         logger.info("NO_TRADE: Candle data insufficient/unavailable.")
@@ -399,27 +434,41 @@ def generate_trade_signal():
     recent_bull_cross = any(recent_candles["ema_9"] <= recent_candles["ema_21"]) and (curr["ema_9"] > curr["ema_21"])
     recent_bear_cross = any(recent_candles["ema_9"] >= recent_candles["ema_21"]) and (curr["ema_9"] < curr["ema_21"])
 
-    is_bullish_trend = curr["close"] > curr["ema_50"]
-    is_bearish_trend = curr["close"] < curr["ema_50"]
+    strong_bull_stack = (
+        (curr["close"] > curr["ema_50"])
+        and (curr["ema_9"] > curr["ema_21"])
+        and (curr["ema_21"] >= curr["ema_50"])
+    )
+    strong_bear_stack = (
+        (curr["close"] < curr["ema_50"])
+        and (curr["ema_9"] < curr["ema_21"])
+        and (curr["ema_21"] <= curr["ema_50"])
+    )
+
+    macro_trend = get_15m_trend()
 
     if (
-        (curr["rsi"] >= 58.0 and curr["roc"] > 0.0 and curr["ema_9"] > curr["ema_21"])
-        and (recent_bull_cross or curr["rsi"] > 62)
-        and is_bullish_trend
+        strong_bull_stack
+        and curr["rsi"] >= 60.0
+        and curr["roc"] > 0.05
+        and (recent_bull_cross or curr["rsi"] >= 63.0)
+        and macro_trend != "BEARISH"
     ):
         return "CE"
 
     elif (
-        (curr["rsi"] <= 42.0 and curr["roc"] < 0.0 and curr["ema_9"] < curr["ema_21"])
-        and (recent_bear_cross or curr["rsi"] < 38)
-        and is_bearish_trend
+        strong_bear_stack
+        and curr["rsi"] <= 40.0
+        and curr["roc"] < -0.05
+        and (recent_bear_cross or curr["rsi"] <= 37.0)
+        and macro_trend != "BULLISH"
     ):
         return "PE"
 
     logger.info(
         f"NO_TRADE | Close: {curr['close']:.2f} | EMA9: {curr['ema_9']:.2f} | "
         f"EMA21: {curr['ema_21']:.2f} | EMA50: {curr['ema_50']:.2f} | "
-        f"RSI: {curr['rsi']:.2f} | ROC: {curr['roc']:.3f}"
+        f"RSI: {curr['rsi']:.2f} | ROC: {curr['roc']:.3f} | 15m: {macro_trend}"
     )
     return "NO_TRADE"
 
@@ -461,7 +510,7 @@ def send_daily_trade_summary():
         net_pnl = round(today_df["PnL_INR"].sum(), 2)
 
         lines = [
-            f"📊 <b>DAILY LIVE TRADE BOOK ({today_str})</b>",
+            f"📊 <b>DAILY TRADE BOOK ({today_str})</b>",
             f"<b>Total Trades:</b> {total_trades} (Wins: {wins} | Losses: {losses})",
             f"<b>Net PnL:</b> ₹{net_pnl}",
             "-------------------------",
@@ -503,8 +552,9 @@ def run_trading_cycle():
         if ENABLE_TRAILING_SL and highest_price_seen > entry_price:
             gain_pct = (highest_price_seen - entry_price) / entry_price
             if gain_pct >= TSL_ACTIVATION_PCT:
-                steps = int((gain_pct - TSL_ACTIVATION_PCT) / TSL_STEP_TRIGGER_PCT) + 1
-                new_sl = round(entry_price * (1 + (steps * TSL_STEP_MOVE_PCT)), 2)
+                extra_steps = int((gain_pct - TSL_ACTIVATION_PCT) / TSL_STEP_TRIGGER_PCT)
+                lock_pct = TSL_LOCK_PCT + (extra_steps * TSL_STEP_MOVE_PCT)
+                new_sl = round(entry_price * (1.0 + lock_pct), 2)
                 if new_sl > sl_price:
                     sl_price = new_sl
                     tsl_activated = True
@@ -582,8 +632,8 @@ def run_trading_cycle():
                                     active_token = tok
                                     active_quantity = qty
                                     entry_price = opt_ltp
-                                    sl_price = round(opt_ltp * (1 - SL_PCT), 2)
-                                    tgt_price = round(opt_ltp * (1 + TARGET_PCT), 2)
+                                    sl_price = round(opt_ltp * (1.0 - SL_PCT), 2)
+                                    tgt_price = round(opt_ltp * (1.0 + TARGET_PCT), 2)
                                     highest_price_seen = opt_ltp
                                     tsl_activated = False
                                     trade_entry_time = get_ist_now()
@@ -607,7 +657,7 @@ if __name__ == "__main__":
         send_telegram_alert("ℹ️ <b>Nifty Algo:</b> Market Closed. Workflow finished successfully.")
         sys.exit(0)
 
-    logger.info("⚡ Engine active (LIVE TRADING): Running live Market Scans...")
+    logger.info("⚡ Engine active: Running live Market Scans...")
     send_telegram_alert("🚀 <b>Nifty Option Algo Active!</b>\nEngine listening for signals...")
 
     time.sleep(10)  # Mandatory startup cooldown for IP rate-limit release
