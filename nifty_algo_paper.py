@@ -43,14 +43,18 @@ if missing_vars:
     print(f">>> [CRITICAL SECURITY ERROR] Missing environment variables: {', '.join(missing_vars)}")
     sys.exit(1)
 
-# Risk Parameters
-SL_PCT = 0.08        # 8.00% Stop Loss
-TARGET_PCT = 0.16    # 16.00% Target Profit
-LOT_SIZE = 65        # Nifty Lot Size (Updated)
+# Risk & Exit Parameters (65-70 Win Rate Tuned)
+SL_PCT = 0.045               # 4.50% Initial Stop Loss
+TARGET_PCT = 0.14            # 14.00% Target Profit
+LOT_SIZE = 65                # Nifty Lot Size
+ITM_STRIKE_OFFSET = 50       # ITM strike offset (ATM - 50 for CE, ATM + 50 for PE)
+MAX_HOLDING_MINUTES = 30     # Theta timeout in minutes
+
 ENABLE_TRAILING_SL = True
-TSL_ACTIVATION_PCT = 0.05
-TSL_STEP_TRIGGER_PCT = 0.03
-TSL_STEP_MOVE_PCT = 0.02
+TSL_ACTIVATION_PCT = 0.025   # Activate TSL at +2.5% gain
+TSL_LOCK_PCT = 0.005         # Initial lock at +0.5% above entry
+TSL_STEP_TRIGGER_PCT = 0.02
+TSL_STEP_MOVE_PCT = 0.015
 
 NIFTY_TOKEN = "99926000"
 MASTER_FILE_LOCAL = "OpenAPIScripMaster.json"
@@ -60,6 +64,7 @@ pos_active = False
 active_symbol = ""
 active_token = ""
 entry_price = 0.0
+entry_time = None
 sl_price = 0.0
 tgt_price = 0.0
 highest_price_seen = 0.0
@@ -239,7 +244,7 @@ def is_squareoff_time():
 
 def get_itm_symbol_and_token(spot_price, option_type):
     atm = round(spot_price / 50) * 50
-    target_strike = (atm - 50) if option_type == "CE" else (atm + 50)
+    target_strike = (atm - ITM_STRIKE_OFFSET) if option_type == "CE" else (atm + ITM_STRIKE_OFFSET)
 
     try:
         cols = {c.lower(): c for c in scrip_master_df.columns}
@@ -303,7 +308,7 @@ def get_15m_trend():
 def fetch_signals_and_data():
     now = get_ist_now()
     to_date = now.strftime("%Y-%m-%d %H:%M")
-    from_date = (now - pd.Timedelta(days=3)).strftime("%Y-%m-%d 09:15")
+    from_date = (now - pd.Timedelta(days=4)).strftime("%Y-%m-%d 09:15")
 
     param = {
         "exchange": "NSE",
@@ -325,26 +330,47 @@ def fetch_signals_and_data():
             df["roc"] = ta.momentum.roc(df["close"], window=9)
             df["ema_9"] = ta.trend.ema_indicator(df["close"], window=9)
             df["ema_21"] = ta.trend.ema_indicator(df["close"], window=21)
-            df["ema_44"] = ta.trend.ema_indicator(df["close"], window=44)
+            df["ema_50"] = ta.trend.ema_indicator(df["close"], window=50)
+            df = df.dropna().reset_index(drop=True)
+
+            if len(df) < 4:
+                return None, "NO_TRADE"
 
             curr = df.iloc[-1]
             recent = df.iloc[-4:-1]
 
-            bullish_cross = any(recent["ema_9"] <= recent["ema_21"]) and (curr["ema_9"] > curr["ema_21"])
-            bearish_cross = any(recent["ema_9"] >= recent["ema_21"]) and (curr["ema_9"] < curr["ema_21"])
+            recent_bull_cross = any(recent["ema_9"] <= recent["ema_21"]) and (curr["ema_9"] > curr["ema_21"])
+            recent_bear_cross = any(recent["ema_9"] >= recent["ema_21"]) and (curr["ema_9"] < curr["ema_21"])
 
-            bounce_ce = (curr["low"] <= curr["ema_44"] * 1.002) and (curr["close"] > curr["ema_44"])
-            reject_pe = (curr["high"] >= curr["ema_44"] * 0.998) and (curr["close"] < curr["ema_44"])
-
-            ce_confirm = (curr["rsi"] >= 58) and (curr["roc"] > 0)
-            pe_confirm = (curr["rsi"] <= 42) and (curr["roc"] < 0)
+            strong_bull_stack = (
+                (curr["close"] > curr["ema_50"])
+                and (curr["ema_9"] > curr["ema_21"])
+                and (curr["ema_21"] >= curr["ema_50"])
+            )
+            strong_bear_stack = (
+                (curr["close"] < curr["ema_50"])
+                and (curr["ema_9"] < curr["ema_21"])
+                and (curr["ema_21"] <= curr["ema_50"])
+            )
 
             macro_trend = get_15m_trend()
 
             signal = "NO_TRADE"
-            if (bullish_cross or bounce_ce) and ce_confirm and macro_trend != "BEARISH":
+            if (
+                strong_bull_stack
+                and curr["rsi"] >= 60.0
+                and curr["roc"] > 0.05
+                and (recent_bull_cross or curr["rsi"] >= 63.0)
+                and macro_trend != "BEARISH"
+            ):
                 signal = "CE"
-            elif (bearish_cross or reject_pe) and pe_confirm and macro_trend != "BULLISH":
+            elif (
+                strong_bear_stack
+                and curr["rsi"] <= 40.0
+                and curr["roc"] < -0.05
+                and (recent_bear_cross or curr["rsi"] <= 37.0)
+                and macro_trend != "BULLISH"
+            ):
                 signal = "PE"
 
             return curr["close"], signal
@@ -358,13 +384,15 @@ def fetch_signals_and_data():
 def execute_order(symbol, token, action_label, qty, price=0.0):
     global total_virtual_pnl
     timestamp = get_ist_now().strftime("%Y-%m-%d %H:%M:%S")
+    tgt_pct_disp = round(TARGET_PCT * 100, 1)
+    sl_pct_disp = round(SL_PCT * 100, 1)
 
     if PAPER_TRADING:
         if action_label == "BUY":
             log_str = (
                 f"\n[PAPER TRADE - VIRTUAL BUY] {timestamp}\n"
                 f"| Symbol: {symbol} | Qty: {qty} | Entry LTP: ₹{price:.2f}\n"
-                f"| Target (+16%): ₹{tgt_price:.2f} | SL (-8%): ₹{sl_price:.2f}\n"
+                f"| Target (+{tgt_pct_disp}%): ₹{tgt_price:.2f} | SL (-{sl_pct_disp}%): ₹{sl_price:.2f}\n"
                 + "-" * 60
             )
             print(log_str)
@@ -372,8 +400,8 @@ def execute_order(symbol, token, action_label, qty, price=0.0):
                 f"🟢 <b>PAPER TRADE BUY ENTRY</b>\n"
                 f"<b>Symbol:</b> {symbol}\n"
                 f"<b>Entry LTP:</b> ₹{price:.2f}\n"
-                f"<b>Target (+16%):</b> ₹{tgt_price:.2f}\n"
-                f"<b>SL (-8%):</b> ₹{sl_price:.2f}"
+                f"<b>Target (+{tgt_pct_disp}%):</b> ₹{tgt_price:.2f}\n"
+                f"<b>SL (-{sl_pct_disp}%):</b> ₹{sl_price:.2f}"
             )
         else:
             pnl_per_qty = price - entry_price
@@ -447,6 +475,7 @@ print(">>> Trading Bot Active... Watching Live Market Data...")
 while is_market_open():
     try:
         close, signal = fetch_signals_and_data()
+        now_ist = get_ist_now()
 
         if close is not None:
             # 1. AUTO SQUARE-OFF AT 15:10
@@ -461,16 +490,17 @@ while is_market_open():
                 )
                 pos_active = False
 
-            # 2. EXIT MONITORING WITH TRAILING SL
+            # 2. EXIT MONITORING WITH TRAILING SL & THETA TIMEOUT
             elif pos_active:
                 ltp = get_live_ltp(active_token, active_symbol)
 
                 if ltp is not None:
                     curr_pnl = (ltp - entry_price) * LOT_SIZE
+                    holding_mins = (now_ist - entry_time).total_seconds() / 60.0 if entry_time else 0.0
                     print(
                         f"[POS WATCH] {active_symbol} | LTP: ₹{ltp:.2f} | Entry:"
-                        f" ₹{entry_price:.2f} | PnL: ₹{curr_pnl:+.2f} | SL:"
-                        f" ₹{sl_price:.2f} | TGT: ₹{tgt_price:.2f}"
+                        f" ₹{entry_price:.2f} | PnL: ₹{curr_pnl:+.2f} | Hold:"
+                        f" {holding_mins:.1f}m | SL: ₹{sl_price:.2f} | TGT: ₹{tgt_price:.2f}"
                     )
 
                     if ltp > highest_price_seen:
@@ -479,15 +509,16 @@ while is_market_open():
                     if ENABLE_TRAILING_SL and highest_price_seen > entry_price:
                         gain_pct = (highest_price_seen - entry_price) / entry_price
                         if gain_pct >= TSL_ACTIVATION_PCT:
-                            steps = int((gain_pct - TSL_ACTIVATION_PCT) / TSL_STEP_TRIGGER_PCT) + 1
-                            new_sl = round(entry_price * (1 + (steps * TSL_STEP_MOVE_PCT)), 2)
+                            extra_steps = int((gain_pct - TSL_ACTIVATION_PCT) / TSL_STEP_TRIGGER_PCT)
+                            lock_pct = TSL_LOCK_PCT + (extra_steps * TSL_STEP_MOVE_PCT)
+                            new_sl = round(entry_price * (1.0 + lock_pct), 2)
                             if new_sl > sl_price:
                                 sl_price = new_sl
                                 tsl_activated = True
                                 print(f"📈 Trailing SL Updated to ₹{sl_price:.2f}")
 
                     if ltp <= sl_price:
-                        reason = "TRAILING_SL_HIT" if tsl_activated else "SL HIT (-8%)"
+                        reason = "TRAILING_SL_HIT" if tsl_activated else f"SL HIT (-{round(SL_PCT * 100, 1)}%)"
                         execute_order(
                             active_symbol,
                             active_token,
@@ -501,7 +532,17 @@ while is_market_open():
                         execute_order(
                             active_symbol,
                             active_token,
-                            "TARGET HIT (+16%)",
+                            f"TARGET HIT (+{round(TARGET_PCT * 100, 1)}%)",
+                            LOT_SIZE,
+                            price=ltp,
+                        )
+                        pos_active = False
+
+                    elif holding_mins >= MAX_HOLDING_MINUTES:
+                        execute_order(
+                            active_symbol,
+                            active_token,
+                            "THETA_TIMEOUT",
                             LOT_SIZE,
                             price=ltp,
                         )
@@ -524,8 +565,9 @@ while is_market_open():
                         if ltp is not None:
                             trade_type = signal
                             entry_price = ltp
-                            sl_price = round(entry_price * (1 - SL_PCT), 2)
-                            tgt_price = round(entry_price * (1 + TARGET_PCT), 2)
+                            entry_time = now_ist
+                            sl_price = round(entry_price * (1.0 - SL_PCT), 2)
+                            tgt_price = round(entry_price * (1.0 + TARGET_PCT), 2)
                             highest_price_seen = entry_price
                             tsl_activated = False
 
