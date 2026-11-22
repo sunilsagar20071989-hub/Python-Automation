@@ -84,6 +84,7 @@ def get_ist_now():
 
 def send_telegram_alert(message):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print(">>> Telegram Alert Skipped: TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID missing.")
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
@@ -92,7 +93,9 @@ def send_telegram_alert(message):
         "parse_mode": "HTML",
     }
     try:
-        http_session.post(url, data=payload, timeout=5)
+        res = http_session.post(url, data=payload, timeout=5)
+        if res.status_code != 200:
+            print(f">>> Telegram HTTP Error {res.status_code}: {res.text}")
     except Exception as e:
         print(">>> Telegram Alert Error:", e)
 
@@ -218,7 +221,10 @@ def get_live_ltp(token, symbol="", exchange="NFO"):
 # 4. HELPER FUNCTIONS & SIGNALS
 # ==========================================
 def is_market_open():
-    now = get_ist_now().time()
+    now_ist = get_ist_now()
+    if now_ist.weekday() == 6:  # Sunday: market closed
+        return False
+    now = now_ist.time()
     return dtime(9, 15) <= now <= dtime(15, 15)
 
 
@@ -430,6 +436,12 @@ def execute_order(symbol, token, action_label, qty, price=0.0):
 # ==========================================
 # 5. MAIN ENGINE
 # ==========================================
+if not is_market_open():
+    closed_msg = f"{get_ist_now().strftime('%H:%M:%S')} - Market Closed. Workflow finished cleanly."
+    print(closed_msg)
+    send_telegram_alert(f"ℹ️ <b>Nifty Algo:</b> {closed_msg}")
+    sys.exit(0)
+
 print(">>> Trading Bot Active... Watching Live Market Data...")
 
 while is_market_open():
@@ -531,4 +543,6 @@ while is_market_open():
         print("Loop Exception:", e)
         time.sleep(5)
 
-print(f"{get_ist_now().strftime('%H:%M:%S')} - Market Closed. Workflow finished cleanly.")
+closed_msg = f"{get_ist_now().strftime('%H:%M:%S')} - Market Closed. Workflow finished cleanly."
+print(closed_msg)
+send_telegram_alert(f"ℹ️ <b>Nifty Algo:</b> {closed_msg}")
