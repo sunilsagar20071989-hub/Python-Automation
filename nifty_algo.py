@@ -263,6 +263,7 @@ def calculate_dynamic_quantity(option_price):
         logger.error(f"Dynamic Sizing Error: {e}")
         return NIFTY_LOT_SIZE
 
+
 # ==========================================
 # 5. TECHNICAL INDICATORS & SCAN ENGINE
 # ==========================================
