@@ -268,7 +268,8 @@ def calculate_dynamic_quantity(option_price):
     except Exception as e:
         logger.error(f"Dynamic Sizing Error: {e}")
         return NIFTY_LOT_SIZE
-        # ==========================================
+        
+# ==========================================        
 # 5. TECHNICAL INDICATORS & SCAN ENGINE
 # ==========================================
 def get_live_ltp(token, symbol, exchange="NFO"):
