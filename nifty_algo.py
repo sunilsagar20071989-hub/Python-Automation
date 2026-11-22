@@ -27,7 +27,6 @@ logger = logging.getLogger("NiftyAlgo")
 # ==========================================
 # 1. HYBRID CONFIG & PARAMETERS
 # ==========================================
-PAPER_TRADING = True
 API_KEY = os.getenv("SMARTAPI_API_KEY") or os.getenv("SMARTAPI_KEY") or os.getenv("API_KEY")
 CLIENT_CODE = os.getenv("SMARTAPI_CLIENT_CODE") or os.getenv("CLIENT_CODE") or os.getenv("CLIENT_ID")
 PIN = os.getenv("SMARTAPI_PIN") or os.getenv("PIN")
@@ -118,8 +117,7 @@ def send_telegram_alert(message, max_retries=3, allow_after_hours=False):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
 
-    prefix = "📄 [PAPER TRADE] " if PAPER_TRADING else "⚡ [REAL TRADE] "
-    full_message = f"{prefix}{message}"
+    full_message = f"⚡ [REAL TRADE] {message}"
 
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
@@ -141,7 +139,7 @@ def log_trade(symbol, trade_type, entry_p, exit_p, qty, reason):
     pnl_pct = round(((exit_p - entry_p) / entry_p) * 100, 2) if entry_p > 0 else 0.0
     log_data = {
         "Timestamp": get_ist_now().strftime("%Y-%m-%d %H:%M:%S"),
-        "Mode": "PAPER" if PAPER_TRADING else "LIVE",
+        "Mode": "LIVE",
         "Symbol": symbol,
         "Type": trade_type,
         "Entry_Price": entry_p,
@@ -154,7 +152,7 @@ def log_trade(symbol, trade_type, entry_p, exit_p, qty, reason):
     df_log = pd.DataFrame([log_data])
     file_exists = os.path.isfile(LOG_FILE)
     df_log.to_csv(LOG_FILE, mode="a", header=not file_exists, index=False)
-    logger.info(f"[{'PAPER' if PAPER_TRADING else 'LIVE'} LOGGED] PnL: ₹{pnl} ({pnl_pct}%) | Exit: {reason}")
+    logger.info(f"[LIVE LOGGED] PnL: ₹{pnl} ({pnl_pct}%) | Exit: {reason}")
 
 
 # ==========================================
@@ -200,9 +198,9 @@ def initialize_smartapi():
 
 def place_order(symbol, token, buy_sell_type, quantity, exchange="NFO"):
     try:
-        if PAPER_TRADING:
-            logger.info(f"[VIRTUAL ORDER] Executed {buy_sell_type} for {symbol} | Qty: {quantity}")
-            return "VIRTUAL_ORDER_123"
+        if smartApi is None:
+            logger.error("SmartAPI client not initialized. Cannot place live order.")
+            return None
 
         rate_limit_cooldown(2.0)
         order_params = {
@@ -217,26 +215,22 @@ def place_order(symbol, token, buy_sell_type, quantity, exchange="NFO"):
             "price": "0",
             "quantity": str(quantity),
         }
-        order_id = "VIRTUAL_ORDER"
-        if smartApi is not None:
-            response = smartApi.placeOrder(order_params)
-            if response and response.get("status") and "data" in response:
-                order_id = response["data"]["orderid"]
-            else:
-                logger.warning("Angel One Order Attempted but rejected/failed. Continuing virtual tracking.")
-                order_id = "REJECTED_ORDER_BOOK"
-        send_telegram_alert(
-            f"<b>ORDER SENT TO BROKER</b>\n"
-            f"<b>Symbol:</b> {symbol}\n"
-            f"<b>Type:</b> {buy_sell_type}\n"
-            f"<b>Qty:</b> {quantity}\n"
-            f"<b>Order ID/Status:</b> {order_id}"
-        )
-        return order_id
+        response = smartApi.placeOrder(order_params)
+        if response and response.get("status") and "data" in response and response["data"].get("orderid"):
+            order_id = response["data"]["orderid"]
+            send_telegram_alert(
+                f"<b>ORDER SENT TO BROKER</b>\n"
+                f"<b>Symbol:</b> {symbol}\n"
+                f"<b>Type:</b> {buy_sell_type}\n"
+                f"<b>Qty:</b> {quantity}\n"
+                f"<b>Order ID:</b> {order_id}"
+            )
+            return order_id
+
+        logger.warning(f"Angel One Order rejected/failed for {symbol}: {response}")
+        return None
     except Exception as e:
         logger.error(f"[ORDER EXCEPTION]: {e}")
-        if PAPER_TRADING:
-            return "VIRTUAL_ORDER_EXCEPTION"
     return None
 
 
@@ -268,8 +262,8 @@ def calculate_dynamic_quantity(option_price):
     except Exception as e:
         logger.error(f"Dynamic Sizing Error: {e}")
         return NIFTY_LOT_SIZE
-        
-# ==========================================        
+
+# ==========================================
 # 5. TECHNICAL INDICATORS & SCAN ENGINE
 # ==========================================
 def get_live_ltp(token, symbol, exchange="NFO"):
@@ -466,7 +460,7 @@ def send_daily_trade_summary():
         net_pnl = round(today_df["PnL_INR"].sum(), 2)
 
         lines = [
-            f"📊 <b>DAILY PAPER TRADE BOOK ({today_str})</b>",
+            f"📊 <b>DAILY LIVE TRADE BOOK ({today_str})</b>",
             f"<b>Total Trades:</b> {total_trades} (Wins: {wins} | Losses: {losses})",
             f"<b>Net PnL:</b> ₹{net_pnl}",
             "-------------------------",
@@ -612,9 +606,7 @@ if __name__ == "__main__":
         send_telegram_alert("ℹ️ <b>Nifty Algo:</b> Market Closed. Workflow finished successfully.")
         sys.exit(0)
 
-    logger.info(
-        f"⚡ Engine active ({'PAPER TRADING' if PAPER_TRADING else 'LIVE TRADING'}): Running live Market Scans..."
-    )
+    logger.info("⚡ Engine active (LIVE TRADING): Running live Market Scans...")
     send_telegram_alert("🚀 <b>Nifty Option Algo Active!</b>\nEngine listening for signals...")
 
     time.sleep(10)  # Mandatory startup cooldown for IP rate-limit release
