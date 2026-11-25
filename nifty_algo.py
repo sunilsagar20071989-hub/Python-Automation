@@ -1,675 +1,376 @@
-import json
-import logging
 import os
-import sys
 import time
-from datetime import datetime, time as dtime
-import pandas as pd
-import pyotp
+import logging
+from datetime import datetime, timedelta
 import pytz
+import pandas as pd
 import requests
-import ta
-
-try:
-    from dotenv import load_dotenv
-
-    load_dotenv()
-except ImportError:
-    pass
+import telebot
 from SmartApi import SmartConnect
+import pyotp
 
 # ==========================================
-# LOGGING CONFIGURATION
+# CONFIGURATION (SOFT / BALANCED MODE)
 # ==========================================
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-logger = logging.getLogger("NiftyAlgo")
+IST = pytz.timezone("Asia/Kolkata")
 
-# ==========================================
-# 1. HYBRID CONFIG & PARAMETERS (65-70 TUNED)
-# ==========================================
-API_KEY = os.getenv("SMARTAPI_API_KEY") or os.getenv("SMARTAPI_KEY") or os.getenv("API_KEY")
-CLIENT_CODE = os.getenv("SMARTAPI_CLIENT_CODE") or os.getenv("CLIENT_CODE") or os.getenv("CLIENT_ID")
-PIN = os.getenv("SMARTAPI_PIN") or os.getenv("PIN")
-TOTP_SECRET = os.getenv("SMARTAPI_TOTP_SECRET") or os.getenv("TOTP_SECRET")
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+# Credentials (set via environment variables or replace locally)
+API_KEY = os.getenv("ANGEL_API_KEY", "YOUR_API_KEY")
+CLIENT_CODE = os.getenv("ANGEL_CLIENT_CODE", "YOUR_CLIENT_CODE")
+MPIN = os.getenv("ANGEL_MPIN", "YOUR_MPIN")
+TOTP_SECRET = os.getenv("ANGEL_TOTP_SECRET", "YOUR_TOTP_SECRET")
 
-DEFAULT_TOTAL_CAPITAL = 100000.0
-SL_PCT = 0.045               # 4.5% Initial Stop Loss
-TARGET_PCT = 0.14            # 14.0% Target Profit
-MAX_RISK_PER_TRADE_PCT = 0.015
-NIFTY_LOT_SIZE = 65          # Nifty Lot Size
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_TG_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "YOUR_TG_CHAT_ID")
 
-ENABLE_TRAILING_SL = True
-TSL_ACTIVATION_PCT = 0.025   # Activate TSL at +2.5% gain
-TSL_LOCK_PCT = 0.005         # Initial lock at +0.5% above entry
-TSL_STEP_TRIGGER_PCT = 0.02
-TSL_STEP_MOVE_PCT = 0.015
+PAPER_TRADING = True
+SCAN_INTERVAL_SEC = 30
+HEARTBEAT_MINUTES = 30
 
-MIN_VIX = 9.0
-MAX_VIX = 26.0
-ITM_STRIKE_OFFSET = 50
-NIFTY_TOKEN = "99926000"
-MAX_DAILY_TRADES = 4
-MAX_HOLDING_MINUTES = 30     # Theta timeout in minutes
-SCAN_INTERVAL_SECONDS = 30   # Increased scan gap for zero rate-limiting
+# Nifty Spot & ITM Option Settings
+NIFTY_SPOT_TOKEN = "99926000"
+NIFTY_EXCHANGE = "NSE"
+OPTION_EXCHANGE = "NFO"
+ITM_OFFSET = 100          # ~100-200 pts ITM strike
+DEFAULT_QTY = 65          # Update per current Nifty lot rules if needed
 
-# Global State Tracking
-pos_active = False
-algo_paused = False
-active_symbol = ""
-active_token = ""
-entry_price = 0.0
-sl_price = 0.0
-tgt_price = 0.0
-highest_price_seen = 0.0
-tsl_activated = False
-active_quantity = NIFTY_LOT_SIZE
-trade_entry_time = None
-daily_trades_count = 0
-consecutive_sl_count = 0
-consecutive_win_count = 0
-scrip_master_df = None
-auth_token = ""
-feed_token = ""
-smartApi = None
-LOG_FILE = "trade_log.csv"
+# Soft / Balanced Technical Thresholds
+RSI_PERIOD = 14
+ROC_PERIOD = 9
+RSI_BULL_MIN = 56.0
+RSI_BEAR_MAX = 44.0
+ROC_BULL_MIN = 0.01
+ROC_BEAR_MAX = -0.01
 
-# Global rate limit tracker
-last_api_call_timestamp = 0.0
+VIX_MIN = 8.0
+VIX_MAX = 30.0
 
+SL_PCT = 0.07             # 7% Stop Loss on option premium
+TARGET_PCT = 0.16         # 16% Target on option premium
 
 # ==========================================
-# 2. TIMEZONE & RATE LIMIT ENGINE
+# LOGGING & TELEGRAM SETUP
 # ==========================================
-def get_ist_now():
-    return datetime.now(pytz.timezone("Asia/Kolkata"))
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    handlers=[logging.StreamHandler(), logging.FileHandler("nifty_soft_algo.log", mode="a")]
+)
+logger = logging.getLogger("NiftySoftAlgo")
+
+bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN) if "YOUR_TG_BOT_TOKEN" not in TELEGRAM_BOT_TOKEN else None
 
 
-def is_market_open():
-    now_time = get_ist_now().time()
-    return dtime(9, 15) <= now_time <= dtime(15, 15)
-
-
-def is_new_entry_allowed():
-    now_time = get_ist_now().time()
-    return dtime(9, 20) <= now_time <= dtime(14, 45)
-
-
-def is_squareoff_time():
-    return get_ist_now().time() >= dtime(15, 10)
-
-
-def rate_limit_cooldown(seconds=4.0):
-    """Enforces strict minimum gap between consecutive API calls."""
-    global last_api_call_timestamp
-    elapsed = time.time() - last_api_call_timestamp
-    if elapsed < seconds:
-        time.sleep(seconds - elapsed)
-    last_api_call_timestamp = time.time()
-
-
-# ==========================================
-# 3. TELEGRAM NOTIFICATION & LOGGING ENGINE
-# ==========================================
-def send_telegram_alert(message, max_retries=3, allow_after_hours=False):
-    current_time = get_ist_now().time()
-    if not allow_after_hours and current_time > dtime(15, 15):
-        return
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        return
-
-    full_message = f"⚡ [ALGO] {message}"
-
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": full_message,
-        "parse_mode": "HTML",
-    }
-    for attempt in range(max_retries):
+def send_tg(msg: str):
+    logger.info(f"TG_MSG: {msg}")
+    if bot and "YOUR_TG_CHAT_ID" not in TELEGRAM_CHAT_ID:
         try:
-            response = requests.post(url, data=payload, timeout=5)
-            if response.status_code == 200:
-                return
-        except Exception:
-            time.sleep(1)
-
-
-def log_trade(symbol, trade_type, entry_p, exit_p, qty, reason):
-    pnl = round((exit_p - entry_p) * qty, 2)
-    pnl_pct = round(((exit_p - entry_p) / entry_p) * 100, 2) if entry_p > 0 else 0.0
-    log_data = {
-        "Timestamp": get_ist_now().strftime("%Y-%m-%d %H:%M:%S"),
-        "Mode": "ENGINE",
-        "Symbol": symbol,
-        "Type": trade_type,
-        "Entry_Price": entry_p,
-        "Exit_Price": exit_p,
-        "Quantity": qty,
-        "PnL_INR": pnl,
-        "PnL_PCT": pnl_pct,
-        "Exit_Reason": reason,
-    }
-    df_log = pd.DataFrame([log_data])
-    file_exists = os.path.isfile(LOG_FILE)
-    df_log.to_csv(LOG_FILE, mode="a", header=not file_exists, index=False)
-    logger.info(f"[LOGGED] PnL: ₹{pnl} ({pnl_pct}%) | Exit: {reason}")
+            bot.send_message(TELEGRAM_CHAT_ID, msg)
+        except Exception as e:
+            logger.error(f"Telegram send failed: {e}")
 
 
 # ==========================================
-# 4. SMARTAPI AUTHENTICATION & EXECUTION ENGINE
+# BROKER & SCRIP MASTER HELPERS
 # ==========================================
-def initialize_smartapi():
-    global smartApi, auth_token, feed_token, scrip_master_df
-    try:
-        if not all([API_KEY, CLIENT_CODE, PIN, TOTP_SECRET]):
-            raise Exception("SmartAPI Credentials missing from Environment Variables.")
-        logger.info("Generating TOTP & Authenticating SmartAPI...")
-        totp = pyotp.TOTP(TOTP_SECRET).now()
-        smartApi = SmartConnect(api_key=API_KEY)
-        data = smartApi.generateSession(CLIENT_CODE, PIN, totp)
-        if not data or not data.get("status"):
-            raise Exception("SmartAPI Login Failed.")
-        auth_token = data["data"]["jwtToken"]
-        feed_token = smartApi.getfeedToken()
-        logger.info("SmartAPI Authentication Successful!")
+def login_smartapi() -> SmartConnect:
+    smart = SmartConnect(api_key=API_KEY)
+    totp = pyotp.TOTP(TOTP_SECRET).now()
+    data = smart.generateSession(CLIENT_CODE, MPIN, totp)
+    if not data or not data.get("status"):
+        raise RuntimeError(f"SmartAPI login failed: {data}")
+    logger.info("SmartAPI login successful.")
+    return smart
 
-        urls = [
-            "https://margincalculator.angelone.in/OpenAPI_File/files/OpenAPIScripMaster.json",
-            "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json",
+
+def load_nifty_options_master() -> pd.DataFrame:
+    url = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
+    resp = requests.get(url, timeout=30)
+    resp.raise_for_status()
+    df = pd.DataFrame(resp.json())
+    nifty_df = df[(df["name"] == "NIFTY") & (df["instrumenttype"] == "OPTIDX")].copy()
+    nifty_df["strike"] = pd.to_numeric(nifty_df["strike"], errors="coerce")
+    nifty_df["expiry_dt"] = pd.to_datetime(nifty_df["expiry"], format="%d%b%Y", errors="coerce")
+    today_midnight = datetime.now(IST).replace(hour=0, minute=0, second=0, microsecond=0, tzinfo=None)
+    nifty_df = nifty_df[nifty_df["expiry_dt"] >= today_midnight].sort_values("expiry_dt")
+    return nifty_df
+
+
+def get_itm_option_contract(nifty_df: pd.DataFrame, spot_price: float, side: str):
+    """
+    side: 'CE' for bullish, 'PE' for bearish
+    Angel One scrip master stores strike multiplied by 100.
+    """
+    base_strike = round(spot_price / 50) * 50
+    if side == "CE":
+        target_strike = base_strike - ITM_OFFSET
+        option_type_suffix = "CE"
+    else:
+        target_strike = base_strike + ITM_OFFSET
+        option_type_suffix = "PE"
+
+    nearest_expiry = nifty_df["expiry_dt"].iloc[0]
+    exp_df = nifty_df[nifty_df["expiry_dt"] == nearest_expiry].copy()
+
+    # Match strike * 100 first, with fallback if needed
+    matched = exp_df[
+        (exp_df["strike"] == target_strike * 100) &
+        (exp_df["symbol"].str.endswith(option_type_suffix))
+    ]
+    if matched.empty:
+        matched = exp_df[
+            (exp_df["strike"] == target_strike) &
+            (exp_df["symbol"].str.endswith(option_type_suffix))
         ]
-        headers = {"User-Agent": "Mozilla/5.0"}
-        for scrip_url in urls:
-            try:
-                res = requests.get(scrip_url, headers=headers, timeout=25)
-                if res.status_code == 200:
-                    scrip_master_df = pd.DataFrame(res.json())
-                    if "token" in scrip_master_df.columns:
-                        scrip_master_df["token"] = scrip_master_df["token"].astype(str)
-                    if "symbol" in scrip_master_df.columns:
-                        scrip_master_df["symbol"] = scrip_master_df["symbol"].astype(str)
-                    logger.info(f"Scrip Master Loaded! Total Records: {len(scrip_master_df)}")
-                    break
-            except Exception:
-                continue
-    except Exception as e:
-        logger.critical(f"Startup Exception: {e}")
-        sys.exit(1)
-
-
-def place_order(symbol, token, buy_sell_type, quantity, exchange="NFO"):
-    try:
-        if smartApi is None:
-            logger.error("SmartAPI client not initialized. Cannot place order.")
-            return None
-
-        rate_limit_cooldown(2.0)
-        order_params = {
-            "variety": "NORMAL",
-            "tradingsymbol": str(symbol),
-            "symboltoken": str(token),
-            "transactiontype": str(buy_sell_type).upper(),
-            "exchange": exchange,
-            "ordertype": "MARKET",
-            "producttype": "CARRYFORWARD",
-            "duration": "DAY",
-            "price": "0",
-            "quantity": str(quantity),
-        }
-        response = smartApi.placeOrder(order_params)
-        if response and response.get("status") and "data" in response and response["data"].get("orderid"):
-            order_id = response["data"]["orderid"]
-            send_telegram_alert(
-                f"<b>ORDER SENT TO BROKER</b>\n"
-                f"<b>Symbol:</b> {symbol}\n"
-                f"<b>Type:</b> {buy_sell_type}\n"
-                f"<b>Qty:</b> {quantity}\n"
-                f"<b>Order ID:</b> {order_id}"
-            )
-            return order_id
-
-        logger.warning(f"Angel One Order rejected/failed for {symbol}: {response}")
+    if matched.empty:
         return None
-    except Exception as e:
-        logger.error(f"[ORDER EXCEPTION]: {e}")
-    return None
-
-
-def calculate_dynamic_quantity(option_price):
-    try:
-        if option_price <= 0:
-            return NIFTY_LOT_SIZE
-        rate_limit_cooldown(2.0)
-        rms_data = smartApi.rmsLimit()
-        net_capital = DEFAULT_TOTAL_CAPITAL
-        if rms_data and rms_data.get("status") and "data" in rms_data:
-            data_dict = rms_data["data"]
-            net_capital = float(data_dict.get("net", data_dict.get("availablecash", DEFAULT_TOTAL_CAPITAL)))
-        if net_capital <= 0:
-            net_capital = DEFAULT_TOTAL_CAPITAL
-        max_risk_amount = net_capital * MAX_RISK_PER_TRADE_PCT
-        risk_per_share = option_price * SL_PCT
-        if risk_per_share <= 0:
-            return NIFTY_LOT_SIZE
-
-        calculated_qty = max_risk_amount / risk_per_share
-        lots = max(1, int(calculated_qty // NIFTY_LOT_SIZE))
-        total_qty = lots * NIFTY_LOT_SIZE
-        if (total_qty * option_price) > net_capital:
-            max_affordable_lots = int(net_capital // (NIFTY_LOT_SIZE * option_price))
-            lots = max(1, max_affordable_lots)
-            total_qty = lots * NIFTY_LOT_SIZE
-        return total_qty
-    except Exception as e:
-        logger.error(f"Dynamic Sizing Error: {e}")
-        return NIFTY_LOT_SIZE
+    return matched.iloc[0].to_dict()
 
 
 # ==========================================
-# 5. TECHNICAL INDICATORS & SCAN ENGINE
+# CANDLES & INDICATORS
 # ==========================================
-def get_live_ltp(token, symbol, exchange="NFO"):
-    try:
-        rate_limit_cooldown(2.0)
-        ltp_data = smartApi.ltpData(exchange, symbol, str(token))
-        if ltp_data and ltp_data.get("status") and "data" in ltp_data:
-            return float(ltp_data["data"]["ltp"])
-    except Exception as e:
-        logger.error(f"REST API LTP Error for {symbol}: {e}")
-    return None
+def fetch_candles(smart: SmartConnect, token: str, interval: str, days: int = 5) -> pd.DataFrame:
+    now_ist = datetime.now(IST)
+    from_dt = (now_ist - timedelta(days=days)).strftime("%Y-%m-%d 09:15")
+    to_dt = now_ist.strftime("%Y-%m-%d %H:%M")
+
+    payload = {
+        "exchange": NIFTY_EXCHANGE,
+        "symboltoken": token,
+        "interval": interval,
+        "fromdate": from_dt,
+        "todate": to_dt,
+    }
+    res = smart.getCandleData(payload)
+    rows = res.get("data") if isinstance(res, dict) else None
+    if not rows:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(rows, columns=["timestamp", "open", "high", "low", "close", "volume"])
+    for col in ["open", "high", "low", "close", "volume"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    df["timestamp"] = pd.to_datetime(df["timestamp"])
+    df = df.dropna(subset=["close"]).sort_values("timestamp").reset_index(drop=True)
+    return df
 
 
-def get_nifty_spot_ltp():
-    return get_live_ltp(NIFTY_TOKEN, "NIFTY", exchange="NSE")
+def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    out["ema_9"] = out["close"].ewm(span=9, adjust=False).mean()
+    out["ema_21"] = out["close"].ewm(span=21, adjust=False).mean()
+    out["ema_50"] = out["close"].ewm(span=50, adjust=False).mean()
+
+    delta = out["close"].diff()
+    gain = delta.clip(lower=0).ewm(alpha=1 / RSI_PERIOD, adjust=False).mean()
+    loss = (-delta.clip(upper=0)).ewm(alpha=1 / RSI_PERIOD, adjust=False).mean()
+    rs = gain / loss.replace(0, pd.NA)
+    out["rsi"] = (100 - (100 / (1 + rs))).fillna(50.0)
+
+    out["roc"] = out["close"].pct_change(ROC_PERIOD) * 100.0
+    return out
 
 
-def get_india_vix():
-    try:
-        if scrip_master_df is not None and not scrip_master_df.empty:
-            vix_row = scrip_master_df[
-                (scrip_master_df["name"] == "INDIA VIX")
-                | (scrip_master_df["symbol"] == "INDIA VIX")
-                | (scrip_master_df["symbol"] == "India Vix")
-            ]
-            if not vix_row.empty:
-                vix_token = str(vix_row.iloc[0]["token"])
-                vix_symbol = str(vix_row.iloc[0]["symbol"])
-                vix_exch = str(vix_row.iloc[0].get("exch_seg", "NSE"))
-
-                vix_ltp = get_live_ltp(vix_token, vix_symbol, exchange=vix_exch)
-                if vix_ltp and 5.0 <= vix_ltp <= 100.0:
-                    return vix_ltp
-
-        direct_vix = get_live_ltp("26009", "INDIA VIX", exchange="NSE")
-        if direct_vix and 5.0 <= direct_vix <= 100.0:
-            return direct_vix
-
-    except Exception as e:
-        logger.error(f"India VIX Fetch Error: {e}")
-
-    return 14.5  # Fallback default safe VIX value
-
-
-def get_itm_option_scrip(spot_price, option_type="CE"):
-    try:
-        if scrip_master_df is None or scrip_master_df.empty:
-            return None, None
-
-        atm_strike = round(spot_price / 50.0) * 50
-        itm_strike = atm_strike - ITM_STRIKE_OFFSET if option_type == "CE" else atm_strike + ITM_STRIKE_OFFSET
-
-        nifty_df = scrip_master_df[
-            (scrip_master_df["name"] == "NIFTY")
-            & (scrip_master_df["instrumenttype"] == "OPTIDX")
-            & (scrip_master_df["symbol"].str.endswith(option_type))
-        ].copy()
-
-        if nifty_df.empty:
-            return None, None
-
-        nifty_df["strike"] = pd.to_numeric(nifty_df["strike"], errors="coerce")
-        nifty_df["expiry_dt"] = pd.to_datetime(nifty_df["expiry"], format="%d%b%Y", errors="coerce")
-        today = pd.Timestamp.now().floor("D")
-
-        valid_df = nifty_df[(nifty_df["strike"] == itm_strike) & (nifty_df["expiry_dt"] >= today)].sort_values(
-            by="expiry_dt"
-        )
-
-        if not valid_df.empty:
-            selected_row = valid_df.iloc[0]
-            return selected_row["symbol"], str(selected_row["token"])
-
-    except Exception as e:
-        logger.error(f"ITM Option Strike Finder Error: {e}")
-
-    return None, None
-
-
-def get_15m_trend():
-    """15-Minute Macro Filter Logic."""
-    try:
-        rate_limit_cooldown(4.0)
-        now = get_ist_now()
-        to_date = now.strftime("%Y-%m-%d %H:%M")
-        from_date = (now - pd.Timedelta(days=4)).strftime("%Y-%m-%d 09:15")
-        resp = smartApi.getCandleData(
-            {
-                "exchange": "NSE",
-                "symboltoken": NIFTY_TOKEN,
-                "interval": "FIFTEEN_MINUTE",
-                "fromdate": from_date,
-                "todate": to_date,
-            }
-        )
-        if resp and resp.get("status") and resp.get("data"):
-            df = pd.DataFrame(resp["data"], columns=["timestamp", "open", "high", "low", "close", "volume"])
-            df["close"] = df["close"].astype(float)
-            df["ema_9"] = ta.trend.ema_indicator(df["close"], window=9)
-            df["ema_21"] = ta.trend.ema_indicator(df["close"], window=21)
-            df_clean = df.dropna()
-            if not df_clean.empty:
-                curr = df_clean.iloc[-1]
-                if curr["ema_9"] > curr["ema_21"]:
-                    return "BULLISH"
-                elif curr["ema_9"] < curr["ema_21"]:
-                    return "BEARISH"
-    except Exception as e:
-        logger.error(f"15m Trend Fetch Error: {e}")
+def get_15m_trend(df_15m: pd.DataFrame) -> str:
+    if df_15m.empty or len(df_15m) < 25:
+        return "NEUTRAL"
+    ind = compute_indicators(df_15m)
+    last = ind.iloc[-1]
+    if last["close"] > last["ema_21"] and last["ema_9"] > last["ema_21"]:
+        return "BULLISH"
+    if last["close"] < last["ema_21"] and last["ema_9"] < last["ema_21"]:
+        return "BEARISH"
     return "NEUTRAL"
 
 
-def fetch_nifty_candles():
-    """Fetch 5-Minute candles with progressive backoff and strict rate limit control."""
-    for attempt in range(3):
+# ==========================================
+# SOFT SIGNAL GENERATOR (5M ENTRY + 15M BIAS)
+# ==========================================
+def evaluate_soft_signal(df_5m: pd.DataFrame, trend_15m: str, vix_val: float = 15.0):
+    if df_5m.empty or len(df_5m) < 55:
+        return None, "Insufficient 5m candles"
+
+    ind = compute_indicators(df_5m)
+    curr = ind.iloc[-1]
+    prev = ind.iloc[-2]
+
+    close_val = float(curr["close"])
+    ema9, ema21, ema50 = float(curr["ema_9"]), float(curr["ema_21"]), float(curr["ema_50"])
+    rsi_val = float(curr["rsi"])
+    roc_val = float(curr["roc"]) if pd.notna(curr["roc"]) else 0.0
+
+    # Soft VIX check
+    if not (VIX_MIN <= vix_val <= VIX_MAX):
+        return None, f"VIX {vix_val:.2f} outside soft range [{VIX_MIN}, {VIX_MAX}]"
+
+    # Bullish (CE Buyer) - Soft conditions
+    bull_price_ok = (close_val > ema50) and (ema9 > ema21)
+    bull_momentum_ok = (rsi_val >= RSI_BULL_MIN) and (roc_val > ROC_BULL_MIN)
+    bull_15m_ok = trend_15m != "BEARISH"
+
+    if bull_price_ok and bull_momentum_ok:
+        if not bull_15m_ok:
+            return None, f"CE blocked by strong 15m BEARISH trend (RSI {rsi_val:.1f}, ROC {roc_val:.2f})"
+        return "CE", f"5m CE | Close {close_val:.1f} > EMA50 {ema50:.1f} | EMA9>EMA21 | RSI {rsi_val:.1f} | ROC {roc_val:.2f} | 15m:{trend_15m}"
+
+    # Bearish (PE Buyer) - Soft conditions
+    bear_price_ok = (close_val < ema50) and (ema9 < ema21)
+    bear_momentum_ok = (rsi_val <= RSI_BEAR_MAX) and (roc_val < ROC_BEAR_MAX)
+    bear_15m_ok = trend_15m != "BULLISH"
+
+    if bear_price_ok and bear_momentum_ok:
+        if not bear_15m_ok:
+            return None, f"PE blocked by strong 15m BULLISH trend (RSI {rsi_val:.1f}, ROC {roc_val:.2f})"
+        return "PE", f"5m PE | Close {close_val:.1f} < EMA50 {ema50:.1f} | EMA9<EMA21 | RSI {rsi_val:.1f} | ROC {roc_val:.2f} | 15m:{trend_15m}"
+
+    status_note = (
+        f"No Signal | Spot:{close_val:.1f} | E9:{ema9:.1f} E21:{ema21:.1f} E50:{ema50:.1f} | "
+        f"RSI:{rsi_val:.1f} | ROC:{roc_val:.2f} | 15m:{trend_15m}"
+    )
+    return None, status_note
+
+
+# ==========================================
+# PAPER / LIVE POSITION MANAGER
+# ==========================================
+class PaperPosition:
+    def __init__(self, symbol: str, token: str, side: str, entry_price: float, qty: int):
+        self.symbol = symbol
+        self.token = token
+        self.side = side
+        self.entry_price = entry_price
+        self.qty = qty
+        self.sl_price = round(entry_price * (1.0 - SL_PCT), 2)
+        self.target_price = round(entry_price * (1.0 + TARGET_PCT), 2)
+        self.entry_time = datetime.now(IST)
+
+
+def get_ltp(smart: SmartConnect, exchange: str, symbol: str, token: str, fallback_price: float) -> float:
+    try:
+        q = smart.ltpData(exchange, symbol, token)
+        ltp = q.get("data", {}).get("ltp")
+        if ltp and float(ltp) > 0:
+            return float(ltp)
+    except Exception as e:
+        logger.warning(f"LTP fetch warning for {symbol}: {e}")
+    return fallback_price
+
+
+def run_bot():
+    send_tg(
+        f"Nifty Soft Algo Started | Mode: {'PAPER' if PAPER_TRADING else 'LIVE'} | "
+        f"RSI: >={RSI_BULL_MIN}/<={RSI_BEAR_MAX} | ROC: >{ROC_BULL_MIN}/<{ROC_BEAR_MAX} | SL:{int(SL_PCT*100)}% Target:{int(TARGET_PCT*100)}%"
+    )
+
+    smart = login_smartapi()
+    options_df = load_nifty_options_master()
+    active_pos: PaperPosition | None = None
+    last_heartbeat = datetime.now(IST) - timedelta(minutes=HEARTBEAT_MINUTES)
+    last_status_line = "Starting up..."
+    realized_pnl = 0.0
+    trades_today = 0
+
+    while True:
+        now = datetime.now(IST)
+        market_open = now.replace(hour=9, minute=15, second=0, microsecond=0)
+        market_close = now.replace(hour=15, minute=25, second=0, microsecond=0)
+        entry_cutoff = now.replace(hour=14, minute=45, second=0, microsecond=0)
+
+        if now.weekday() >= 5 or not (market_open <= now <= market_close):
+            logger.info(f"Market closed or weekend ({now.strftime('%Y-%m-%d %H:%M:%S')}). Sleeping 60s...")
+            time.sleep(60)
+            continue
+
         try:
-            rate_limit_cooldown(5.0)  # Extended gap before candle fetch
-            now = get_ist_now()
-            to_date = now.strftime("%Y-%m-%d %H:%M")
-            from_date = (now - pd.Timedelta(days=5)).strftime("%Y-%m-%d 09:15")
+            df_5m = fetch_candles(smart, NIFTY_SPOT_TOKEN, "FIVE_MINUTE", days=5)
+            df_15m = fetch_candles(smart, NIFTY_SPOT_TOKEN, "FIFTEEN_MINUTE", days=7)
+            trend_15m = get_15m_trend(df_15m)
 
-            candles = smartApi.getCandleData(
-                {
-                    "exchange": "NSE",
-                    "symboltoken": NIFTY_TOKEN,
-                    "interval": "FIVE_MINUTE",
-                    "fromdate": from_date,
-                    "todate": to_date,
-                }
-            )
+            side, reason = evaluate_soft_signal(df_5m, trend_15m, vix_val=15.0)
+            last_status_line = reason
+            logger.info(reason)
 
-            if candles and isinstance(candles, dict) and candles.get("status") and "data" in candles:
-                df = pd.DataFrame(
-                    candles["data"],
-                    columns=["timestamp", "open", "high", "low", "close", "volume"],
+            # Manage existing position first
+            if active_pos is not None:
+                est_ltp = active_pos.entry_price
+                ltp = get_ltp(smart, OPTION_EXCHANGE, active_pos.symbol, active_pos.token, est_ltp)
+
+                exit_reason = None
+                if ltp <= active_pos.sl_price:
+                    exit_reason = f"SL Hit ({ltp:.2f} <= {active_pos.sl_price:.2f})"
+                elif ltp >= active_pos.target_price:
+                    exit_reason = f"Target Hit ({ltp:.2f} >= {active_pos.target_price:.2f})"
+                elif now >= market_close - timedelta(minutes=3):
+                    exit_reason = f"Square-off ({ltp:.2f})"
+
+                if exit_reason:
+                    pnl = (ltp - active_pos.entry_price) * active_pos.qty
+                    realized_pnl += pnl
+                    send_tg(
+                        f"EXIT ({active_pos.side}) {active_pos.symbol}\n"
+                        f"Reason: {exit_reason}\n"
+                        f"Entry: {active_pos.entry_price:.2f} -> Exit: {ltp:.2f}\n"
+                        f"Trade PnL: Rs {pnl:.2f} | Day Realized: Rs {realized_pnl:.2f}"
+                    )
+                    active_pos = None
+
+            # Look for new entry if flat and before cutoff
+            elif side in ("CE", "PE") and now <= entry_cutoff:
+                spot_now = float(df_5m.iloc[-1]["close"])
+                contract = get_itm_option_contract(options_df, spot_now, side)
+                if not contract:
+                    send_tg(f"Signal {side} found at Spot {spot_now:.1f}, but ITM contract not matched in scrip master.")
+                else:
+                    sym = contract["symbol"]
+                    tok = str(contract["token"])
+                    # Approximate premium fallback if live option LTP isn't fetched
+                    approx_prem = 160.0 if side == "CE" else 155.0
+                    entry_prem = get_ltp(smart, OPTION_EXCHANGE, sym, tok, approx_prem)
+
+                    if PAPER_TRADING:
+                        active_pos = PaperPosition(sym, tok, side, entry_prem, DEFAULT_QTY)
+                        trades_today += 1
+                        send_tg(
+                            f"PAPER ENTRY ({side}) {sym}\n"
+                            f"Spot: {spot_now:.1f} | Entry Prem: {entry_prem:.2f} | Qty: {DEFAULT_QTY}\n"
+                            f"SL: {active_pos.sl_price:.2f} (-{int(SL_PCT*100)}%) | Target: {active_pos.target_price:.2f} (+{int(TARGET_PCT*100)}%)\n"
+                            f"Info: {reason}"
+                        )
+                    else:
+                        order_params = {
+                            "variety": "NORMAL",
+                            "tradingsymbol": sym,
+                            "symboltoken": tok,
+                            "transactiontype": "BUY",
+                            "exchange": OPTION_EXCHANGE,
+                            "ordertype": "MARKET",
+                            "producttype": "INTRADAY",
+                            "duration": "DAY",
+                            "price": "0",
+                            "squareoff": "0",
+                            "stoploss": "0",
+                            "quantity": str(DEFAULT_QTY),
+                        }
+                        resp = smart.placeOrder(order_params)
+                        logger.info(f"Live order response: {resp}")
+                        send_tg(f"LIVE BUY ORDER SENT ({side}) {sym} Qty:{DEFAULT_QTY} | Resp: {resp}")
+
+            # Periodic Telegram Heartbeat so you always know the bot is active
+            if (now - last_heartbeat).total_seconds() >= HEARTBEAT_MINUTES * 60:
+                pos_text = f"{active_pos.symbol} @{active_pos.entry_price:.2f}" if active_pos else "FLAT"
+                send_tg(
+                    f"Heartbeat ({now.strftime('%H:%M')}) | Pos: {pos_text} | Trades: {trades_today} | PnL: Rs {realized_pnl:.2f}\n"
+                    f"{last_status_line}"
                 )
-                df["close"] = df["close"].astype(float)
-                df["rsi"] = ta.momentum.rsi(df["close"], window=14)
-                df["roc"] = ta.momentum.roc(df["close"], window=9)
-                df["ema_9"] = ta.trend.ema_indicator(df["close"], window=9)
-                df["ema_21"] = ta.trend.ema_indicator(df["close"], window=21)
-                df["ema_50"] = ta.trend.ema_indicator(df["close"], window=50)
-                return df.dropna().reset_index(drop=True)
-
-            logger.warning(f"Candle Data Attempt {attempt+1} blocked or invalid. Retrying in 6s...")
-            time.sleep(6)
+                last_heartbeat = now
 
         except Exception as e:
-            logger.error(f"Candle Data Attempt {attempt+1} Exception: {e}")
-            time.sleep(6)
+            err_msg = f"Loop error: {e}"
+            logger.exception(err_msg)
+            send_tg(err_msg)
 
-    return None
-
-
-def generate_trade_signal():
-    """Single-fetch Signal Engine with 9/21/50 EMA Stack, RSI 60/40, ROC ±0.05 & 15m Filter."""
-    df = fetch_nifty_candles()
-    if df is None or len(df) < 5:
-        logger.info("NO_TRADE: Candle data insufficient/unavailable.")
-        return "NO_TRADE"
-
-    curr = df.iloc[-1]
-    recent_candles = df.iloc[-4:-1]
-
-    recent_bull_cross = any(recent_candles["ema_9"] <= recent_candles["ema_21"]) and (curr["ema_9"] > curr["ema_21"])
-    recent_bear_cross = any(recent_candles["ema_9"] >= recent_candles["ema_21"]) and (curr["ema_9"] < curr["ema_21"])
-
-    strong_bull_stack = (
-        (curr["close"] > curr["ema_50"])
-        and (curr["ema_9"] > curr["ema_21"])
-        and (curr["ema_21"] >= curr["ema_50"])
-    )
-    strong_bear_stack = (
-        (curr["close"] < curr["ema_50"])
-        and (curr["ema_9"] < curr["ema_21"])
-        and (curr["ema_21"] <= curr["ema_50"])
-    )
-
-    macro_trend = get_15m_trend()
-
-    if (
-        strong_bull_stack
-        and curr["rsi"] >= 60.0
-        and curr["roc"] > 0.05
-        and (recent_bull_cross or curr["rsi"] >= 63.0)
-        and macro_trend != "BEARISH"
-    ):
-        return "CE"
-
-    elif (
-        strong_bear_stack
-        and curr["rsi"] <= 40.0
-        and curr["roc"] < -0.05
-        and (recent_bear_cross or curr["rsi"] <= 37.0)
-        and macro_trend != "BULLISH"
-    ):
-        return "PE"
-
-    logger.info(
-        f"NO_TRADE | Close: {curr['close']:.2f} | EMA9: {curr['ema_9']:.2f} | "
-        f"EMA21: {curr['ema_21']:.2f} | EMA50: {curr['ema_50']:.2f} | "
-        f"RSI: {curr['rsi']:.2f} | ROC: {curr['roc']:.3f} | 15m: {macro_trend}"
-    )
-    return "NO_TRADE"
+        time.sleep(SCAN_INTERVAL_SEC)
 
 
-def cleanup_position():
-    global pos_active, active_symbol, active_token, entry_price, sl_price, tgt_price, highest_price_seen, tsl_activated
-    pos_active = False
-    active_symbol = ""
-    active_token = ""
-    entry_price = 0.0
-    sl_price = 0.0
-    tgt_price = 0.0
-    highest_price_seen = 0.0
-    tsl_activated = False
-
-
-def send_daily_trade_summary():
-    today_str = get_ist_now().strftime("%Y-%m-%d")
-    if not os.path.isfile(LOG_FILE):
-        send_telegram_alert(
-            f"📊 <b>DAILY SUMMARY ({today_str})</b>\nNo trades triggered today (0 trades).",
-            allow_after_hours=True,
-        )
-        return
-
-    try:
-        df_log = pd.read_csv(LOG_FILE)
-        today_df = df_log[df_log["Timestamp"].astype(str).str.startswith(today_str)]
-        if today_df.empty:
-            send_telegram_alert(
-                f"📊 <b>DAILY SUMMARY ({today_str})</b>\nNo trades triggered today (0 trades).",
-                allow_after_hours=True,
-            )
-            return
-
-        total_trades = len(today_df)
-        wins = len(today_df[today_df["PnL_INR"] > 0])
-        losses = len(today_df[today_df["PnL_INR"] < 0])
-        net_pnl = round(today_df["PnL_INR"].sum(), 2)
-
-        lines = [
-            f"📊 <b>DAILY TRADE BOOK ({today_str})</b>",
-            f"<b>Total Trades:</b> {total_trades} (Wins: {wins} | Losses: {losses})",
-            f"<b>Net PnL:</b> ₹{net_pnl}",
-            "-------------------------",
-        ]
-        for _, row in today_df.iterrows():
-            lines.append(
-                f"• {row['Symbol']} | Entry: ₹{row['Entry_Price']} → Exit: ₹{row['Exit_Price']} | "
-                f"PnL: ₹{row['PnL_INR']} ({row['PnL_PCT']}%) [{row['Exit_Reason']}]"
-            )
-
-        send_telegram_alert("\n".join(lines), allow_after_hours=True)
-    except Exception as e:
-        logger.error(f"Daily Summary Error: {e}")
-
-
-# ==========================================
-# 6. MAIN TRADING EXECUTION ENGINE
-# ==========================================
-def run_trading_cycle():
-    global pos_active, active_symbol, active_token, entry_price, sl_price, tgt_price
-    global highest_price_seen, tsl_activated, active_quantity, trade_entry_time
-    global daily_trades_count, consecutive_sl_count, consecutive_win_count
-
-    if is_squareoff_time() and pos_active:
-        ltp = get_live_ltp(active_token, active_symbol) or entry_price
-        place_order(active_symbol, active_token, "SELL", active_quantity)
-        log_trade(active_symbol, "SELL", entry_price, ltp, active_quantity, "AUTO_SQUARE_OFF")
-        send_telegram_alert(f"⏰ AUTO SQUARE-OFF (03:10 PM) | Exit: ₹{ltp:.2f}")
-        cleanup_position()
-        return
-
-    if pos_active:
-        ltp = get_live_ltp(active_token, active_symbol) or entry_price
-        holding_time_mins = (get_ist_now() - trade_entry_time).total_seconds() / 60.0
-
-        if ltp > highest_price_seen:
-            highest_price_seen = ltp
-
-        if ENABLE_TRAILING_SL and highest_price_seen > entry_price:
-            gain_pct = (highest_price_seen - entry_price) / entry_price
-            if gain_pct >= TSL_ACTIVATION_PCT:
-                extra_steps = int((gain_pct - TSL_ACTIVATION_PCT) / TSL_STEP_TRIGGER_PCT)
-                lock_pct = TSL_LOCK_PCT + (extra_steps * TSL_STEP_MOVE_PCT)
-                new_sl = round(entry_price * (1.0 + lock_pct), 2)
-                if new_sl > sl_price:
-                    sl_price = new_sl
-                    tsl_activated = True
-                    logger.info(f"📈 Trailing SL Updated to ₹{sl_price:.2f}")
-
-        if ltp <= sl_price:
-            reason = "TRAILING_SL_HIT" if tsl_activated else "INITIAL_SL_HIT"
-            place_order(active_symbol, active_token, "SELL", active_quantity)
-            log_trade(active_symbol, "SELL", entry_price, ltp, active_quantity, reason)
-            send_telegram_alert(
-                f"🔴 <b>STOP LOSS HIT ({reason})</b>\n"
-                f"<b>Symbol:</b> {active_symbol}\n"
-                f"<b>Exit Price:</b> ₹{ltp:.2f}\n"
-                f"<b>PnL:</b> ₹{round((ltp - entry_price) * active_quantity, 2)}"
-            )
-            cleanup_position()
-            daily_trades_count += 1
-            consecutive_sl_count += 1
-            consecutive_win_count = 0
-
-        elif ltp >= tgt_price:
-            place_order(active_symbol, active_token, "SELL", active_quantity)
-            log_trade(active_symbol, "SELL", entry_price, ltp, active_quantity, "TARGET_ACHIEVED")
-            send_telegram_alert(
-                f"🟢 <b>TARGET ACHIEVED</b> 🎉\n"
-                f"<b>Symbol:</b> {active_symbol}\n"
-                f"<b>Exit Price:</b> ₹{ltp:.2f}\n"
-                f"<b>PnL:</b> ₹{round((ltp - entry_price) * active_quantity, 2)}"
-            )
-            cleanup_position()
-            daily_trades_count += 1
-            consecutive_win_count += 1
-            consecutive_sl_count = 0
-
-        elif holding_time_mins >= MAX_HOLDING_MINUTES:
-            place_order(active_symbol, active_token, "SELL", active_quantity)
-            log_trade(active_symbol, "SELL", entry_price, ltp, active_quantity, "THETA_TIMEOUT")
-            send_telegram_alert(
-                f"⏱️ <b>THETA TIMEOUT EXIT</b>\n"
-                f"<b>Symbol:</b> {active_symbol}\n"
-                f"<b>Exit Price:</b> ₹{ltp:.2f}\n"
-                f"<b>PnL:</b> ₹{round((ltp - entry_price) * active_quantity, 2)}"
-            )
-            cleanup_position()
-            daily_trades_count += 1
-            if ltp < entry_price:
-                consecutive_sl_count += 1
-                consecutive_win_count = 0
-
-    elif not pos_active and not algo_paused and is_new_entry_allowed():
-        if daily_trades_count >= MAX_DAILY_TRADES:
-            logger.info(f"🛑 Max Daily Limit ({MAX_DAILY_TRADES}) Reached.")
-        elif consecutive_sl_count >= 2:
-            logger.info("🛑 2 Consecutive Losses Hit! Halting strategy today.")
-        elif consecutive_win_count >= 3:
-            logger.info("🎉 3 Consecutive Wins Hit! Targets achieved today.")
-        else:
-            signal = generate_trade_signal()
-            if signal in ["CE", "PE"]:
-                spot = get_nifty_spot_ltp()
-                if spot and spot > 0:
-                    vix = get_india_vix()
-                    if not (MIN_VIX <= vix <= MAX_VIX):
-                        logger.info(f"Entry Blocked: VIX ({vix}) out of bounds ({MIN_VIX}-{MAX_VIX})")
-                    else:
-                        sym, tok = get_itm_option_scrip(spot, option_type=signal)
-                        if sym and tok:
-                            opt_ltp = get_live_ltp(tok, sym)
-                            if opt_ltp and opt_ltp > 0:
-                                qty = calculate_dynamic_quantity(opt_ltp)
-                                order_id = place_order(sym, tok, "BUY", qty)
-                                if order_id:
-                                    pos_active = True
-                                    active_symbol = sym
-                                    active_token = tok
-                                    active_quantity = qty
-                                    entry_price = opt_ltp
-                                    sl_price = round(opt_ltp * (1.0 - SL_PCT), 2)
-                                    tgt_price = round(opt_ltp * (1.0 + TARGET_PCT), 2)
-                                    highest_price_seen = opt_ltp
-                                    tsl_activated = False
-                                    trade_entry_time = get_ist_now()
-                                    send_telegram_alert(
-                                        f"🚀 <b>NEW TRADE ENTERED ({signal})</b>\n"
-                                        f"<b>Symbol:</b> {sym}\n"
-                                        f"<b>Entry Price:</b> ₹{entry_price:.2f}\n"
-                                        f"<b>SL:</b> ₹{sl_price:.2f}\n"
-                                        f"<b>Target:</b> ₹{tgt_price:.2f}\n"
-                                        f"<b>Qty:</b> {qty}"
-                                    )
-
-
-# ==========================================
-# MAIN ENTRYPOINT
-# ==========================================
 if __name__ == "__main__":
-    initialize_smartapi()
-    if not is_market_open():
-        logger.info("Market is Closed. Engine terminating cleanly.")
-        send_telegram_alert("ℹ️ <b>Nifty Algo:</b> Market Closed. Workflow finished successfully.")
-        sys.exit(0)
-
-    logger.info("⚡ Engine active: Running live Market Scans...")
-    send_telegram_alert("🚀 <b>Nifty Option Algo Active!</b>\nEngine listening for signals...")
-
-    time.sleep(10)  # Mandatory startup cooldown for IP rate-limit release
-
-    while is_market_open():
-        try:
-            run_trading_cycle()
-            time.sleep(2 if pos_active else SCAN_INTERVAL_SECONDS)
-        except Exception as main_e:
-            logger.error(f"Main Engine Exception: {main_e}")
-            time.sleep(5)
-
-    logger.info("Market hours finished. Stopping engine.")
-    send_daily_trade_summary()
-    sys.exit(0)
+    run_bot()
